@@ -1,0 +1,96 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f7f9fb;
+  --surface: #ffffff;
+  --ink: #16232e;
+  --accent: #2c6e8c;
+  --success: #2f9e6e;
+  --alert: #d64545;
+  --muted: #5c6b78;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-ink: var(--ink);
+  --color-accent: var(--accent);
+  --color-success: var(--success);
+  --color-alert: var(--alert);
+  --color-muted: var(--muted);
+  --font-sans: var(--font-inter);
+  --font-heading: var(--font-space-grotesk);
+}
+
+body {
+  background: var(--background);
+  color: var(--ink);
+  font-family: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+}
+
+.hud-frame {
+  position: relative;
+  border: 1px solid color-mix(in srgb, var(--ink) 14%, transparent);
+  background: var(--surface);
+}
+
+.hud-frame::before,
+.hud-frame::after {
+  content: "";
+  position: absolute;
+  width: 1.25rem;
+  height: 1.25rem;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.hud-frame::before {
+  top: -1px;
+  left: -1px;
+  border-top: 2px solid var(--accent);
+  border-left: 2px solid var(--accent);
+}
+
+.hud-frame::after {
+  top: -1px;
+  right: -1px;
+  border-top: 2px solid var(--accent);
+  border-right: 2px solid var(--accent);
+}
+
+.hud-corners {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.hud-corners::before,
+.hud-corners::after {
+  content: "";
+  position: absolute;
+  width: 1.25rem;
+  height: 1.25rem;
+}
+
+.hud-corners::before {
+  bottom: -1px;
+  left: -1px;
+  border-bottom: 2px solid var(--accent);
+  border-left: 2px solid var(--accent);
+}
+
+.hud-corners::after {
+  bottom: -1px;
+  right: -1px;
+  border-bottom: 2px solid var(--accent);
+  border-right: 2px solid var(--accent);
+}
+
+.safe-zone {
+  position: absolute;
+  inset: 7% 5%;
+  border: 1px dashed color-mix(in srgb, var(--accent) 50%, transparent);
+  pointer-events: none;
+  z-index: 2;
+}
