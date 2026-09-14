@@ -1,0 +1,65 @@
+{
+  "thumbs_up": {
+    "gesture_type": "pose",
+    "reference_features": [
+      -0.6278,
+      -1.7723,
+      -0.89567,
+      -0.60609,
+      -0.86417,
+      -0.30554,
+      -0.80819,
+      -0.00785,
+      -0.73669,
+      0.26563,
+      1.72383,
+      0.91573,
+      0.91681,
+      0.91014,
+      0.89835
+    ],
+    "feature_tolerance": 0.85,
+    "frames_used": 12,
+    "frames_submitted": 22,
+    "gesture": "thumbs_up",
+    "domain": "sign_language"
+  },
+  "open_palm": {
+    "gesture_type": "pose",
+    "reference_features": [
+      -0.85389,
+      -0.55666,
+      -0.39273,
+      -0.91987,
+      -0.13341,
+      -0.90716,
+      0.15335,
+      -0.77634,
+      0.50127,
+      -0.61865,
+      1.65909,
+      1.04928,
+      1.03798,
+      1.0787,
+      1.20693
+    ],
+    "feature_tolerance": 0.55,
+    "frames_used": 4,
+    "frames_submitted": 13,
+    "gesture": "open_palm",
+    "domain": "sign_language"
+  },
+  "exit_pointing": {
+    "gesture_type": "pose",
+    "target_elbow_angle_deg": 148.77,
+    "elbow_angle_tolerance_deg": 30.0,
+    "horizontal_y_tolerance": 0.1,
+    "match_threshold": 0.55,
+    "left_arm_angle_avg": 154.81,
+    "right_arm_angle_avg": 142.73,
+    "frames_used": 16,
+    "frames_submitted": 26,
+    "gesture": "exit_pointing",
+    "domain": "aviation"
+  }
+}

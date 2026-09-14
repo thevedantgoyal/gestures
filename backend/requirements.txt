@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+websockets
+numpy
+fastdtw
+google-genai
+boto3
+python-dotenv
+sqlalchemy
+psycopg2-binary
+python-multipart
