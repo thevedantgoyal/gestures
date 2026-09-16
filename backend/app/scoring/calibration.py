@@ -252,7 +252,7 @@ def _build_hand_wave_reference(
         "feature_kind": "hand_wave",
         "reference_sequence": sequence,
         "max_dtw_distance": round(
-            max(1.0, DTW_DISTANCE_PER_FRAME * len(sequence) * 1.2), 3
+            max(1.8, DTW_DISTANCE_PER_FRAME * len(sequence) * 1.2), 3
         ),
         "frames_used": captured_frames,
     }

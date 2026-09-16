@@ -8,13 +8,14 @@ Each gesture has a gesture_type of "pose" (held position) or "motion" (DTW seque
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
-from app.scoring.sign_meanings import SIGN_GESTURES
+from sqlalchemy import select
+
+from app.db import session_scope
+from app.models import RecordedReference
+from app.scoring.sign_meanings import SIGN_GESTURES, SIGN_MEANINGS
 
 GestureType = Literal["pose", "motion"]
 GestureDomain = Literal["aviation", "sign_language"]
@@ -41,10 +42,16 @@ GESTURE_REGISTRY: dict[str, GestureSpec] = {
         "domain": "aviation",
     },
     "thumbs_up": {"name": "thumbs_up", "type": "pose", "domain": "sign_language"},
+    "thumbs_down": {"name": "thumbs_down", "type": "pose", "domain": "sign_language"},
     "open_palm": {"name": "open_palm", "type": "pose", "domain": "sign_language"},
     "fist": {"name": "fist", "type": "pose", "domain": "sign_language"},
     "pointing": {"name": "pointing", "type": "pose", "domain": "sign_language"},
     "peace_sign": {"name": "peace_sign", "type": "pose", "domain": "sign_language"},
+    "please": {"name": "please", "type": "pose", "domain": "sign_language"},
+    "you": {"name": "you", "type": "pose", "domain": "sign_language"},
+    "want": {"name": "want", "type": "pose", "domain": "sign_language"},
+    "okay": {"name": "okay", "type": "pose", "domain": "sign_language"},
+    "i_love_you": {"name": "i_love_you", "type": "pose", "domain": "sign_language"},
     "wave": {"name": "wave", "type": "motion", "domain": "sign_language"},
 }
 
@@ -167,7 +174,7 @@ _DEFAULTS: dict[str, PoseReference | MotionReference] = {
     "wave": DEFAULT_WAVE,
 }
 
-# Cache of what was loaded from / written to recorded_references.json.
+# Cache of recorded overlays loaded from Postgres for live scoring.
 _recorded: dict[str, dict[str, Any]] = {}
 
 
@@ -186,65 +193,84 @@ def is_known_gesture(gesture: str) -> bool:
 
 
 def load_recorded_references() -> dict[str, dict[str, Any]]:
-    """Read recorded_references.json into the in-memory cache (called on startup)."""
+    """Read recorded references from Postgres into the in-memory cache."""
     global _recorded
-
-    if not RECORDED_REFERENCES_PATH.exists():
-        _recorded = {}
-        return _recorded
-
+    loaded: dict[str, dict[str, Any]] = {}
     try:
-        with RECORDED_REFERENCES_PATH.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (json.JSONDecodeError, OSError) as err:
-        print(f"[references] could not read {RECORDED_REFERENCES_PATH.name}: {err}")
-        _recorded = {}
-        return _recorded
-
-    if not isinstance(data, dict):
-        _recorded = {}
-        return _recorded
-
-    _recorded = {
-        name: value
-        for name, value in data.items()
-        if name in GESTURE_REGISTRY and isinstance(value, dict)
-    }
+        with session_scope() as db:
+            rows = db.scalars(select(RecordedReference)).all()
+            for row in rows:
+                if row.gesture not in GESTURE_REGISTRY or not isinstance(row.payload, dict):
+                    continue
+                loaded[row.gesture] = dict(row.payload)
+    except Exception as err:
+        print(f"[references] could not load from Postgres: {err}")
+        loaded = {}
+    _recorded = loaded
     print(f"[references] loaded recorded references: {sorted(_recorded)}")
     return _recorded
 
 
 def save_recorded_reference(gesture: str, payload: dict[str, Any]) -> None:
-    """Persist one recorded gesture reference and refresh the cache."""
+    """Persist one recorded gesture reference in Postgres and refresh the cache."""
     if gesture not in GESTURE_REGISTRY:
         raise ValueError(f"Unknown gesture key: {gesture}")
 
-    # Always store gesture_type so the file is self-describing.
+    spec = GESTURE_REGISTRY[gesture]
     stored = {
         **payload,
         "gesture": gesture,
-        "gesture_type": GESTURE_REGISTRY[gesture]["type"],
-        "domain": GESTURE_REGISTRY[gesture]["domain"],
+        "gesture_type": spec["type"],
+        "domain": spec["domain"],
     }
+    with session_scope() as db:
+        row = db.get(RecordedReference, gesture)
+        if row is None:
+            db.add(
+                RecordedReference(
+                    gesture=gesture,
+                    name=SIGN_MEANINGS.get(gesture, gesture),
+                    gesture_type=spec["type"],
+                    domain=spec["domain"],
+                    payload=stored,
+                )
+            )
+        else:
+            row.name = SIGN_MEANINGS.get(gesture, gesture)
+            row.gesture_type = spec["type"]
+            row.domain = spec["domain"]
+            row.payload = stored
     _recorded[gesture] = stored
-
-    RECORDED_REFERENCES_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    handle = tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=RECORDED_REFERENCES_PATH.parent,
-        delete=False,
-    )
-    try:
-        with handle:
-            json.dump(_recorded, handle, indent=2)
-        os.replace(handle.name, RECORDED_REFERENCES_PATH)
-    except BaseException:
-        Path(handle.name).unlink(missing_ok=True)
-        raise
-
     print(f"[references] saved recorded reference for {gesture}")
+
+
+def clear_recorded_reference(gesture: str) -> bool:
+    """Drop one recorded reference so the built-in default is used."""
+    removed = False
+    with session_scope() as db:
+        row = db.get(RecordedReference, gesture)
+        if row is not None:
+            db.delete(row)
+            removed = True
+    if gesture in _recorded:
+        del _recorded[gesture]
+        removed = True
+    if removed:
+        print(f"[references] cleared recorded reference for {gesture}")
+    return removed
+
+
+def clear_all_recorded_references() -> int:
+    """Drop every recorded reference."""
+    count = len(_recorded)
+    with session_scope() as db:
+        rows = db.scalars(select(RecordedReference)).all()
+        count = max(count, len(rows))
+        for row in rows:
+            db.delete(row)
+    _recorded.clear()
+    print(f"[references] cleared all recorded references ({count})")
+    return count
 
 
 def _merge_pose(default: PoseReference, recorded: dict[str, Any] | None) -> PoseReference:

@@ -22,11 +22,35 @@ SIGN_ATTEMPT_FEEDBACK_THRESHOLD = 0.35  # show live Incorrect / trying below mat
 
 SIGN_POSE_GESTURES = (
     "thumbs_up",
+    "thumbs_down",
     "open_palm",
     "fist",
     "pointing",
     "peace_sign",
+    "please",
+    "you",
+    "want",
+    "okay",
+    "i_love_you",
 )
+
+AviationClass = Literal["exit_pointing", "seatbelt_demo", "none"]
+SignClass = Literal[
+    "thumbs_up",
+    "thumbs_down",
+    "open_palm",
+    "fist",
+    "pointing",
+    "peace_sign",
+    "please",
+    "you",
+    "want",
+    "okay",
+    "i_love_you",
+    "wave",
+    "none",
+]
+GestureClass = AviationClass | SignClass
 
 HAND_LANDMARK_KEYS = (
     "wrist",
@@ -52,18 +76,6 @@ HAND_LANDMARK_KEYS = (
     "pinky_tip",
 )
 
-AviationClass = Literal["exit_pointing", "seatbelt_demo", "none"]
-SignClass = Literal[
-    "thumbs_up",
-    "open_palm",
-    "fist",
-    "pointing",
-    "peace_sign",
-    "wave",
-    "none",
-]
-GestureClass = AviationClass | SignClass
-
 # Exit pointing — multi-signal attempt (normalized to shoulder width).
 EXIT_HEIGHT_SLACK = 0.18  # wrist may sit slightly below shoulder line
 EXIT_MIN_SPREAD_RATIO = 0.75  # wrist lateral / shoulder_width
@@ -85,10 +97,15 @@ SEATBELT_MIN_CLOSING_DELTA = 0.04
 AVIATION_HOLD_FRAMES = 4
 
 
-# Finger extension: tip must be substantially farther from wrist than the MCP.
+# Finger extension: tip must be substantially farther from the wrist than the MCP.
 FINGER_EXTENDED_MCP_RATIO = 1.28
-# Wave: min std-dev of wrist x across the live buffer (raised to avoid stealing holds).
-WAVE_MIN_WRIST_X_STD = 0.055
+# Goodbye is a wag: left-right-left (or right-left-right), not a held palm.
+WAVE_MIN_SAMPLES = 5
+WAVE_MIN_AMPLITUDE = 0.08
+WAVE_REVERSAL_DELTA = 0.022
+WAVE_MIN_REVERSALS = 2
+# Mean wrist travel between frames — used for overlay / progress only.
+HAND_MOTION_ACTIVE_THRESHOLD = 0.016
 
 HAND_TIP_KEYS = (
     "thumb_tip",
@@ -271,13 +288,24 @@ def has_low_hand_visibility(landmarks: dict[str, Any]) -> bool:
 
 def _finger_extended(landmarks: dict[str, Any], tip_key: str, pip_key: str, mcp_key: str) -> bool:
     """True when a finger is clearly outstretched from the palm."""
+    return _finger_extension_ratio(landmarks, tip_key, mcp_key) > FINGER_EXTENDED_MCP_RATIO
+
+
+def _finger_extension_ratio(
+    landmarks: dict[str, Any],
+    tip_key: str,
+    mcp_key: str,
+) -> float:
+    """Tip distance from wrist divided by MCP distance from wrist."""
     wrist = _point(landmarks, "wrist")
     tip = _point(landmarks, tip_key)
     mcp = _point(landmarks, mcp_key)
     if not wrist or not tip or not mcp:
-        return False
-    # Curled fingertips sit near the MCP; extended tips sit well beyond it.
-    return _dist2(wrist, tip) > _dist2(wrist, mcp) * FINGER_EXTENDED_MCP_RATIO
+        return 0.0
+    base = _dist2(wrist, mcp)
+    if base < 1e-6:
+        return 0.0
+    return _dist2(wrist, tip) / base
 
 
 def _thumb_extended_up(landmarks: dict[str, Any]) -> bool:
@@ -292,11 +320,65 @@ def _thumb_extended_up(landmarks: dict[str, Any]) -> bool:
     return extended and pointing_up
 
 
+def _thumb_extended_down(landmarks: dict[str, Any]) -> bool:
+    """Thumb tip clearly below the MCP (image y larger) and away from the palm."""
+    wrist = _point(landmarks, "wrist")
+    tip = _point(landmarks, "thumb_tip")
+    mcp = _point(landmarks, "thumb_mcp")
+    if not wrist or not tip or not mcp:
+        return False
+    extended = _dist2(wrist, tip) > _dist2(wrist, mcp) * 1.15
+    pointing_down = tip["y"] > mcp["y"] + 0.02
+    return extended and pointing_down
+
+
+def _mean_finger_extension(landmarks: dict[str, Any]) -> float:
+    ratios = [
+        _finger_extension_ratio(landmarks, "index_tip", "index_mcp"),
+        _finger_extension_ratio(landmarks, "middle_tip", "middle_mcp"),
+        _finger_extension_ratio(landmarks, "ring_tip", "ring_mcp"),
+        _finger_extension_ratio(landmarks, "pinky_tip", "pinky_mcp"),
+    ]
+    return float(sum(ratios) / 4.0)
+
+
+def looks_like_thumbs_up(landmarks: dict[str, Any]) -> bool:
+    """Thumb sticks clearly above a closed fist — not a tucked thumb on a fist."""
+    if not is_hand_landmarks(landmarks):
+        return False
+    tip = _point(landmarks, "thumb_tip")
+    mcp = _point(landmarks, "thumb_mcp")
+    if not tip or not mcp:
+        return False
+    if tip["y"] >= mcp["y"] - 0.05:
+        return False
+    thumb_r = _finger_extension_ratio(landmarks, "thumb_tip", "thumb_mcp")
+    others = _mean_finger_extension(landmarks)
+    if thumb_r < 1.22:
+        return False
+    if others > 1.22:
+        return False
+    return thumb_r >= others + 0.14
+
+
+def looks_like_fist(landmarks: dict[str, Any]) -> bool:
+    """Closed hand: four fingers curled and the thumb not raised as Yes."""
+    if not is_hand_landmarks(landmarks):
+        return False
+    if looks_like_thumbs_up(landmarks):
+        return False
+    if _thumb_extended_down(landmarks):
+        return False
+    others = _mean_finger_extension(landmarks)
+    return others <= 1.22
+
+
 def finger_extension_flags(landmarks: dict[str, Any]) -> dict[str, bool] | None:
     if not is_hand_landmarks(landmarks):
         return None
     return {
         "thumb_up": _thumb_extended_up(landmarks),
+        "thumb_down": _thumb_extended_down(landmarks),
         "thumb": _finger_extended(landmarks, "thumb_tip", "thumb_ip", "thumb_mcp"),
         "index": _finger_extended(landmarks, "index_tip", "index_pip", "index_mcp"),
         "middle": _finger_extended(landmarks, "middle_tip", "middle_pip", "middle_mcp"),
@@ -357,17 +439,27 @@ def _heuristic_sign_score(landmarks: dict[str, Any], gesture: str) -> float:
     ring = flags["ring"]
     pinky = flags["pinky"]
     thumb_up = flags["thumb_up"]
+    thumb_down = flags["thumb_down"]
     others = (index, middle, ring, pinky)
 
     if gesture == "thumbs_up":
+        if looks_like_thumbs_up(landmarks):
+            return 0.95
+        if looks_like_fist(landmarks):
+            return 0.15
         curled = sum(1 for f in others if not f)
-        return min(1.0, (0.55 if thumb_up else 0.0) + 0.1125 * curled)
+        return min(0.45, (0.25 if thumb_up else 0.0) + 0.05 * curled)
+    if gesture == "thumbs_down":
+        curled = sum(1 for f in others if not f)
+        return min(1.0, (0.55 if thumb_down else 0.0) + 0.1125 * curled)
     if gesture == "open_palm":
         extended = sum(1 for f in others if f)
         return min(1.0, 0.25 * extended + (0.1 if flags["thumb"] else 0.0))
     if gesture == "fist":
+        if looks_like_fist(landmarks):
+            return 0.95
         curled = sum(1 for f in others if not f)
-        thumb_ok = not thumb_up
+        thumb_ok = not thumb_up and not thumb_down
         return min(1.0, 0.2 * curled + (0.2 if thumb_ok else 0.0))
     if gesture == "pointing":
         score = 0.0
@@ -382,6 +474,52 @@ def _heuristic_sign_score(landmarks: dict[str, Any], gesture: str) -> float:
         if middle:
             score += 0.3
         score += 0.2 * sum(1 for f in (ring, pinky) if not f)
+        return min(1.0, score)
+    if gesture == "please":
+        score = 0.0
+        if thumb_up:
+            score += 0.4
+        if pinky:
+            score += 0.35
+        score += 0.083 * sum(1 for f in (index, middle, ring) if not f)
+        return min(1.0, score)
+    if gesture == "i_love_you":
+        score = 0.0
+        if thumb_up:
+            score += 0.25
+        if index:
+            score += 0.25
+        if pinky:
+            score += 0.25
+        score += 0.125 * sum(1 for f in (middle, ring) if not f)
+        return min(1.0, score)
+    if gesture == "want":
+        score = 0.0
+        if index:
+            score += 0.25
+        if middle:
+            score += 0.25
+        if ring:
+            score += 0.25
+        if not pinky:
+            score += 0.25
+        return min(1.0, score)
+    if gesture == "you":
+        score = 0.0
+        if pinky:
+            score += 0.45
+        score += 0.183 * sum(1 for f in (index, middle, ring) if not f)
+        return min(1.0, score)
+    if gesture == "okay":
+        score = 0.0
+        if not index:
+            score += 0.3
+        if middle:
+            score += 0.23
+        if ring:
+            score += 0.23
+        if pinky:
+            score += 0.24
         return min(1.0, score)
     return 0.0
 
@@ -622,22 +760,70 @@ def classify_aviation_attempt_legacy(landmarks: dict[str, Any]) -> AviationClass
     return label
 
 
-def _buffer_looks_like_wave(buffer: list[dict[str, Any]]) -> bool:
+def _wrist_x_series(buffer: list[dict[str, Any]]) -> list[float]:
     xs: list[float] = []
     for frame in buffer:
         wrist = _point(frame, "wrist")
         if wrist:
             xs.append(float(wrist["x"]))
-    if len(xs) < 5:
+    return xs
+
+
+def wave_direction_reversals(xs: list[float]) -> int:
+    """Count left↔right direction changes large enough to be a wag, not jitter."""
+    if len(xs) < 3:
+        return 0
+    reversals = 0
+    last_direction = 0
+    last_x = xs[0]
+    for x in xs[1:]:
+        delta = x - last_x
+        if abs(delta) < WAVE_REVERSAL_DELTA:
+            continue
+        direction = 1 if delta > 0 else -1
+        if last_direction != 0 and direction != last_direction:
+            reversals += 1
+        last_direction = direction
+        last_x = x
+    return reversals
+
+
+def buffer_looks_like_wave(buffer: list[dict[str, Any]]) -> bool:
+    """True only for a repeated side-to-side wag, never a held or arriving palm."""
+    xs = _wrist_x_series(buffer)
+    if len(xs) < WAVE_MIN_SAMPLES:
         return False
-    return float(np.std(xs)) >= WAVE_MIN_WRIST_X_STD
+    amplitude = max(xs) - min(xs)
+    if amplitude < WAVE_MIN_AMPLITUDE:
+        return False
+    return wave_direction_reversals(xs) >= WAVE_MIN_REVERSALS
+
+
+def _buffer_looks_like_wave(buffer: list[dict[str, Any]]) -> bool:
+    return buffer_looks_like_wave(buffer)
+
+
+def hand_motion_energy(buffer: list[dict[str, Any]]) -> float:
+    """Mean wrist displacement between consecutive hand frames."""
+    if len(buffer) < 2:
+        return 0.0
+    deltas: list[float] = []
+    prev = _point(buffer[0], "wrist")
+    for frame in buffer[1:]:
+        wrist = _point(frame, "wrist")
+        if prev and wrist:
+            deltas.append(_dist2(prev, wrist))
+        prev = wrist
+    if not deltas:
+        return 0.0
+    return float(np.mean(deltas))
 
 
 def classify_sign_attempt(
     landmarks: dict[str, Any],
     buffer: list[dict[str, Any]] | None = None,
 ) -> SignClass:
-    """Classify a hand landmark frame into one of the 6 signs (or none)."""
+    """Classify a hand landmark frame into a known sign (or none)."""
     flags = finger_extension_flags(landmarks)
     if not flags:
         return "none"
@@ -647,10 +833,25 @@ def classify_sign_attempt(
     ring = flags["ring"]
     pinky = flags["pinky"]
     thumb_up = flags["thumb_up"]
+    thumb_down = flags["thumb_down"]
+    frames = buffer or []
 
-    # Held shapes first — wrist jitter must not steal open-palm / thumbs-up.
-    if thumb_up and not index and not middle and not ring and not pinky:
+    # More specific finger combinations first so they are not stolen by
+    # thumbs-up / pointing / open-palm / wave.
+    if thumb_up and index and pinky and not middle and not ring:
+        return "i_love_you"
+
+    if thumb_up and pinky and not index and not middle and not ring:
+        return "please"
+
+    if looks_like_thumbs_up(landmarks):
         return "thumbs_up"
+
+    if thumb_down and not index and not middle and not ring and not pinky:
+        return "thumbs_down"
+
+    if index and middle and ring and not pinky:
+        return "want"
 
     if index and middle and not ring and not pinky:
         return "peace_sign"
@@ -658,14 +859,24 @@ def classify_sign_attempt(
     if index and not middle and not ring and not pinky:
         return "pointing"
 
-    if index and middle and ring and pinky:
-        return "open_palm"
+    if pinky and not index and not middle and not ring:
+        return "you"
+
+    if (not index) and middle and ring and pinky:
+        return "okay"
+
+    if looks_like_fist(landmarks):
+        return "fist"
 
     if not index and not middle and not ring and not pinky:
         return "fist"
 
-    if buffer and _buffer_looks_like_wave(buffer):
+    # Goodbye is a wag, not a held palm — require left-right-left motion.
+    if index and middle and buffer_looks_like_wave(frames):
         return "wave"
+
+    if index and middle and ring and pinky:
+        return "open_palm"
 
     return "none"
 
@@ -950,7 +1161,11 @@ def score_hand_pose(
             live, ref_features, tolerance
         )
         deviations.append(feature_detail)
-        score = max(float(feature_score), heuristic)
+        # A recorded template must not override a hand shape that does not match.
+        if heuristic < 0.4:
+            score = heuristic
+        else:
+            score = max(float(feature_score), heuristic)
         deviations.append(
             {
                 "joint": "hand_hybrid",
@@ -971,6 +1186,13 @@ def score_hand_pose(
                 "live_len": len(live),
             }
         )
+
+    if gesture == "thumbs_up" and looks_like_fist(landmarks):
+        score = min(score, 0.28)
+    if gesture == "fist" and looks_like_fist(landmarks):
+        score = max(score, 0.88)
+    if gesture == "thumbs_up" and looks_like_thumbs_up(landmarks):
+        score = max(score, 0.88)
 
     matched = score >= threshold
     return {
@@ -1061,6 +1283,18 @@ def wrist_features_relative_to_waist(landmarks: dict[str, Any]) -> list[float] |
     ]
 
 
+def _center_wave_xy(series: list[list[float]]) -> np.ndarray:
+    """Remove absolute camera position so a recorded wave matches anywhere in frame."""
+    arr = np.asarray(series, dtype=float)
+    if arr.size == 0 or arr.shape[1] < 2:
+        return arr
+    origin = arr[:, :2].mean(axis=0)
+    centered = arr.copy()
+    centered[:, 0] -= origin[0]
+    centered[:, 1] -= origin[1]
+    return centered
+
+
 def score_motion(
     landmark_sequence: list[dict[str, Any]],
     reference: MotionReference,
@@ -1068,9 +1302,13 @@ def score_motion(
     """Compare a buffered feature sequence to a motion reference via FastDTW."""
     deviations: list[dict[str, Any]] = []
     hints: list[str] = []
-    min_frames = max(3, len(reference["reference_sequence"]) // 2)
     match_threshold = float(reference["match_threshold"])
     feature_kind = reference.get("feature_kind", "wrist_waist")
+    ref_len = len(reference["reference_sequence"])
+    if feature_kind == "hand_wave":
+        min_frames = min(max(3, ref_len // 2), 5)
+    else:
+        min_frames = max(3, ref_len // 2)
 
     feature_fn = (
         hand_wave_features if feature_kind == "hand_wave" else wrist_features_relative_to_waist
@@ -1137,11 +1375,17 @@ def score_motion(
                 ],
             }
 
-    live = np.asarray(live_series, dtype=float)
-    ref = np.asarray(ref_series, dtype=float)
+    max_distance = float(reference["max_dtw_distance"])
+    if feature_kind == "hand_wave":
+        live = _center_wave_xy(live_series)
+        ref = _center_wave_xy(ref_series)
+        max_distance = max(max_distance, 1.8)
+        match_threshold = min(match_threshold, 0.55)
+    else:
+        live = np.asarray(live_series, dtype=float)
+        ref = np.asarray(ref_series, dtype=float)
 
     distance, _path = fastdtw(live, ref, dist=_euclidean)
-    max_distance = reference["max_dtw_distance"]
     score = max(0.0, min(1.0, 1.0 - (float(distance) / max_distance)))
 
     deviations.append(

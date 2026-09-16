@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from collections.abc import Generator
 from contextlib import contextmanager
+from urllib.parse import quote_plus
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -17,13 +18,26 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from app import config as _config  # noqa: F401
 
 
+def _sqlalchemy_driver() -> str:
+    """Prefer psycopg2; fall back to pg8000 if the native DLL is blocked."""
+    try:
+        import psycopg2  # noqa: F401
+
+        return "psycopg2"
+    except Exception:
+        return "pg8000"
+
+
 def _database_url() -> str:
     host = os.environ.get("DB_HOST", "localhost")
     port = os.environ.get("DB_PORT", "5432")
     name = os.environ.get("DB_NAME", "gestures")
     user = os.environ.get("DB_USER", "postgres")
-    password = os.environ.get("DB_PASSWORD", "postgres")
-    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{name}"
+    password = quote_plus(os.environ.get("DB_PASSWORD", "postgres"))
+    return (
+        f"postgresql+{_sqlalchemy_driver()}://"
+        f"{quote_plus(user)}:{password}@{host}:{port}/{quote_plus(name)}"
+    )
 
 
 def _db_target_label() -> str:
@@ -56,6 +70,10 @@ def init_db() -> None:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         Base.metadata.create_all(bind=engine)
+        # Imported here to avoid a persist <-> db cycle at module load.
+        from app.persist import migrate_local_files_into_postgres
+
+        migrate_local_files_into_postgres()
         print(f"[db] tables ready ({target})")
     except Exception as err:
         print("[db] ERROR: PostgreSQL is not reachable — session history will not work.")

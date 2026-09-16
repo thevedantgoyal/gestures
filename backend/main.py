@@ -34,13 +34,16 @@ from app.scoring.calibration import (
 )
 from app.scoring.engine import (
     AVIATION_HOLD_FRAMES,
+    HAND_MOTION_ACTIVE_THRESHOLD,
     SEATBELT_MIN_CLOSING_DELTA,
     SIGN_ATTEMPT_FEEDBACK_THRESHOLD,
     SIGN_RECOGNITION_THRESHOLD,
     assess_hand_framing,
     best_sign_pose,
+    buffer_looks_like_wave,
     classify_aviation_attempt,
     classify_gesture_attempt,
+    hand_motion_energy,
     has_low_wrist_visibility,
     is_aviation_idle,
     score_motion,
@@ -59,7 +62,27 @@ from app.scoring.reference_gestures import (
     recorded_reference_details,
     reference_status,
     save_recorded_reference,
+    clear_all_recorded_references,
+    clear_recorded_reference,
 )
+from app.ml.dataset import (
+    DatasetError,
+    DatasetStoreError,
+    append_gold_hold,
+    build_hold_from_sequence,
+    get_dataset_stats,
+    list_gold_holds,
+)
+from app.ml.infer import (
+    apply_model_to_sign_result,
+    demote_to_rules,
+    load_live_model,
+    promote_model,
+    set_shadow_model,
+)
+from app.ml.registry import RegistryError, latest_meta, list_versions, read_meta
+from app.ml.runtime import get_runtime, load_runtime, ws_recognizer_fields
+from app.ml.train import TrainError, train_sign_classifier
 from app.scoring.sign_meanings import SIGN_MEANINGS
 from app.services.coaching import get_coaching_text
 from app.sessions import (
@@ -75,13 +98,15 @@ from app.config import COACHING_FALLBACK_TEXT
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    load_recorded_references()
     try:
         init_db()
     except Exception:
         # init_db already printed a clear console error — keep the API up for
         # live scoring even when history logging is unavailable.
         pass
+    load_recorded_references()
+    load_runtime()
+    load_live_model()
     yield
 
 
@@ -96,7 +121,7 @@ app.add_middleware(
 )
 
 # Frontend sends ~every 200ms; keep ~2 seconds of history for motion (DTW) only.
-BUFFER_MAX_FRAMES = 10
+BUFFER_MAX_FRAMES = 16
 # Avoid hammering the LLM on every incorrect frame while the pose is held.
 COACHING_COOLDOWN_SECONDS = 3.0
 # Hard cap so a hung Gemini call never leaves the client spinning forever.
@@ -116,6 +141,17 @@ class ReferenceRecordRequest(BaseModel):
     landmark_sequence: list[dict[str, Any]]
     # Optional — inferred from the gesture registry when omitted.
     gesture_type: GestureTypeLiteral | None = None
+
+
+class SampleRecordRequest(BaseModel):
+    gesture: str = Field(..., min_length=1)
+    landmark_sequence: list[dict[str, Any]]
+    session_id: str | None = None
+
+
+class RuntimeUpdateRequest(BaseModel):
+    source: Literal["heuristic", "model"]
+    version: str | None = None
 
 
 @app.get("/health")
@@ -349,6 +385,29 @@ def record_reference(request: ReferenceRecordRequest):
     }
 
 
+@app.delete("/reference/{gesture}")
+def delete_recorded_reference(gesture: str):
+    name = gesture.strip()
+    if not is_known_gesture(name):
+        raise HTTPException(status_code=422, detail=f"Unknown gesture '{name}'.")
+    cleared = clear_recorded_reference(name)
+    return {
+        "status": "cleared" if cleared else "already_default",
+        "gesture": name,
+        "reference_status": reference_status(),
+    }
+
+
+@app.post("/reference/reset")
+def reset_recorded_references():
+    cleared = clear_all_recorded_references()
+    return {
+        "status": "reset",
+        "cleared": cleared,
+        "reference_status": reference_status(),
+    }
+
+
 @app.get("/reference/details")
 def get_reference_details():
     """Full recorded payloads plus the references currently in use."""
@@ -356,6 +415,175 @@ def get_reference_details():
         "status": reference_status(),
         "recorded": recorded_reference_details(),
         "active": active_references(),
+    }
+
+
+@app.get("/ml/runtime")
+def ml_runtime():
+    """Talk-path recognizer contract."""
+    return get_runtime()
+
+
+@app.post("/ml/runtime")
+def ml_set_runtime(request: RuntimeUpdateRequest):
+    """Switch Talk between hardcoded rules and a promoted model."""
+    try:
+        if request.source == "heuristic":
+            runtime = demote_to_rules()
+        else:
+            version = request.version
+            if not version:
+                meta = latest_meta()
+                if not meta:
+                    raise HTTPException(
+                        status_code=409, detail="Train a model before promoting."
+                    )
+                version = str(meta["version"])
+            runtime = promote_model(version)
+    except RegistryError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    return {
+        "status": "updated",
+        "runtime": runtime,
+        "stats": get_dataset_stats(),
+    }
+
+
+@app.get("/ml/stats")
+def ml_stats():
+    """Gold-hold counts per sign plus overall training progress."""
+    try:
+        return get_dataset_stats()
+    except DatasetStoreError as err:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable — check PostgreSQL and DB_* in .env",
+        ) from err
+
+
+@app.get("/ml/models")
+def ml_models():
+    versions = list_versions()
+    models: list[dict[str, Any]] = []
+    for version in versions:
+        try:
+            models.append(read_meta(version))
+        except RegistryError:
+            continue
+    runtime = get_runtime()
+    return {
+        "live_model_id": runtime.get("live_model_id"),
+        "source": runtime.get("source"),
+        "models": models,
+    }
+
+
+@app.post("/ml/train")
+def ml_train():
+    """Fit a softmax classifier on gold holds. Talk stays on rules until promote."""
+    try:
+        meta = train_sign_classifier()
+    except TrainError as err:
+        raise HTTPException(status_code=409, detail=str(err)) from err
+    except DatasetStoreError as err:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable — check PostgreSQL and DB_* in .env",
+        ) from err
+    except RegistryError as err:
+        raise HTTPException(status_code=503, detail=str(err)) from err
+    except Exception as err:  # noqa: BLE001
+        print(f"[ml] train failed: {err}")
+        raise HTTPException(status_code=500, detail=str(err)) from err
+    set_shadow_model(str(meta["version"]))
+    try:
+        stats = get_dataset_stats()
+    except DatasetStoreError as err:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable — check PostgreSQL and DB_* in .env",
+        ) from err
+    return {
+        "status": "trained",
+        "model": meta,
+        "stats": stats,
+    }
+
+
+@app.post("/ml/models/{version}/promote")
+def ml_promote(version: str):
+    """Make this trained model the live Talk recognizer for static signs."""
+    try:
+        runtime = promote_model(version)
+    except RegistryError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    return {
+        "status": "promoted",
+        "runtime": runtime,
+        "stats": get_dataset_stats(),
+    }
+
+
+@app.post("/ml/samples")
+def ml_add_samples(request: SampleRecordRequest):
+    """Append one confirmed hold to PostgreSQL. Does not change Talk."""
+    try:
+        hold = build_hold_from_sequence(
+            gesture=request.gesture,
+            landmark_sequence=request.landmark_sequence,
+            session_id=request.session_id,
+            source="user",
+        )
+    except DatasetError as err:
+        raise HTTPException(status_code=422, detail=str(err)) from err
+
+    try:
+        append_gold_hold(hold)
+        stats = get_dataset_stats()
+    except DatasetStoreError as err:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable — sample was not saved.",
+        ) from err
+    gold_holds = 0
+    for row in stats["gestures"]:
+        if row["gesture"] == hold["gesture"]:
+            gold_holds = int(row["gold_holds"])
+            break
+
+    print(
+        f"[ml] saved hold {hold['id']} gesture={hold['gesture']} "
+        f"name={hold['name']} frames={hold['frame_count']} gold_holds={gold_holds}"
+    )
+    return {
+        "status": "saved",
+        "gesture": hold["gesture"],
+        "name": hold["name"],
+        "hold_id": hold["id"],
+        "frame_count": hold["frame_count"],
+        "gold_holds": gold_holds,
+        "stats": stats,
+    }
+
+
+@app.get("/ml/samples")
+def ml_list_samples(
+    gesture: str | None = None,
+    name: str | None = None,
+    limit: int = 200,
+):
+    """Return gold holds from Postgres, optionally filtered by sign key or spoken name."""
+    try:
+        holds = list_gold_holds(gesture=gesture, name=name, limit=limit)
+    except DatasetStoreError as err:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable — check PostgreSQL and DB_* in .env",
+        ) from err
+    return {
+        "status": "ok",
+        "count": len(holds),
+        "samples": holds,
     }
 
 
@@ -532,10 +760,19 @@ def _evaluate_sign_language(
     )
 
     frames = list(buffer)
+    motion = hand_motion_energy(frames)
+    motion_active = motion >= HAND_MOTION_ACTIVE_THRESHOLD
+    hand_style = "motion" if motion_active else "hold"
+    motion_meta = {
+        "motion_energy": round(motion, 4),
+        "motion_active": motion_active,
+        "hand_style": hand_style,
+    }
+
     attempt = classify_gesture_attempt(
         landmarks, mode="sign_language", buffer=frames
     )
-    print(f"[classify] mode=sign_language attempt={attempt}")
+    print(f"[classify] mode=sign_language attempt={attempt} motion={motion:.4f}")
 
     best_gesture, best_score, pose_scores, pose_detail = best_sign_pose(
         landmarks,
@@ -553,46 +790,65 @@ def _evaluate_sign_language(
             "scores": pose_scores,
             "attempted_gesture": best_gesture or attempt,
             "deviations": pose_detail.get("deviations", []),
+            **motion_meta,
         }
 
     if attempt == "wave":
         motion_result = score_motion(frames, get_reference("wave"))
-        scores = {**pose_scores, "wave": float(motion_result.get("score") or 0.0)}
-        if not motion_result.get("ready"):
+        wave_score = float(motion_result.get("score") or 0.0)
+        scores = {**pose_scores, "wave": wave_score}
+        wag = buffer_looks_like_wave(frames)
+        # A held palm is Hello. Goodbye only after a real left-right wag.
+        if wag:
             return {
                 "gesture": "wave",
-                "correct": False,
-                "score": 0.0,
-                "meaning": None,
-                "reason": "motion_buffering",
+                "correct": True,
+                "meaning": SIGN_MEANINGS["wave"],
+                "score": max(wave_score, 0.72),
+                "reason": None,
                 "attempted_gesture": "wave",
-                "buffer_progress": motion_result.get("buffer_progress", 0.0),
-                "buffer_frames": motion_result.get("buffer_frames"),
-                "buffer_needed": motion_result.get("buffer_needed"),
+                "hint": None,
+                "dtw_distance": motion_result.get("dtw_distance"),
+                "buffer_progress": 1.0,
                 "scores": scores,
                 "deviations": motion_result.get("deviations", []),
                 "framing": framing,
+                **motion_meta,
             }
-        wave_score = float(motion_result.get("score") or 0.0)
-        matched = wave_score >= SIGN_RECOGNITION_THRESHOLD and bool(
-            motion_result.get("matched")
-        )
+        progress = motion_result.get("buffer_progress", 0.0)
+        if motion_active:
+            progress = max(float(progress or 0.0), 0.4)
         return {
             "gesture": "wave",
-            "correct": matched,
-            "meaning": SIGN_MEANINGS["wave"] if matched else None,
+            "correct": False,
             "score": wave_score,
-            "reason": None if matched else "not_recognized",
+            "meaning": None,
+            "reason": "motion_in_progress" if motion_active else "motion_buffering",
             "attempted_gesture": "wave",
-            "hint": None if matched else "Try a slightly wider, slower wave",
-            "dtw_distance": motion_result.get("dtw_distance"),
+            "buffer_progress": progress,
+            "buffer_frames": motion_result.get("buffer_frames"),
+            "buffer_needed": motion_result.get("buffer_needed"),
             "scores": scores,
             "deviations": motion_result.get("deviations", []),
             "framing": framing,
+            "hint": "Wag your hand left and right twice for Goodbye",
+            **motion_meta,
         }
 
     display_gesture = best_gesture
-    if (
+    if attempt == "fist":
+        display_gesture = "fist"
+        best_score = max(
+            float(pose_scores.get("fist") or 0.0),
+            SIGN_RECOGNITION_THRESHOLD + 0.08,
+        )
+    elif attempt == "thumbs_up":
+        display_gesture = "thumbs_up"
+        best_score = max(
+            float(pose_scores.get("thumbs_up") or 0.0),
+            SIGN_RECOGNITION_THRESHOLD + 0.08,
+        )
+    elif (
         attempt in pose_scores
         and attempt not in ("none", "wave")
         and float(pose_scores.get(attempt, 0.0))
@@ -613,6 +869,7 @@ def _evaluate_sign_language(
             "classified_as": attempt,
             "deviations": pose_detail.get("deviations", []),
             "framing": framing,
+            **motion_meta,
         }
 
     if display_gesture and best_score >= SIGN_ATTEMPT_FEEDBACK_THRESHOLD:
@@ -627,6 +884,7 @@ def _evaluate_sign_language(
             "classified_as": attempt,
             "deviations": pose_detail.get("deviations", []),
             "framing": framing,
+            **motion_meta,
         }
 
     return {
@@ -639,6 +897,7 @@ def _evaluate_sign_language(
         "classified_as": attempt,
         "deviations": pose_detail.get("deviations", []),
         "framing": framing,
+        **motion_meta,
     }
 
 
@@ -766,6 +1025,8 @@ async def landmarks_ws(websocket: WebSocket):
                 last_mode = mode if isinstance(mode, str) else None
 
             response = _none_result(timestamp)
+            sign_model_fields: dict[str, Any] | None = None
+            sign_recognizer: str | None = None
 
             if isinstance(landmarks, dict) and landmarks:
                 # Only buffer frames that match the active landmark schema.
@@ -900,10 +1161,14 @@ async def landmarks_ws(websocket: WebSocket):
                         response = _none_result(
                             timestamp, reason="waiting_for_hand_landmarks"
                         )
+                        response.update(ws_recognizer_fields())
                         await websocket.send_json(response)
                         continue
 
                     scored = _evaluate_sign_language(landmarks, landmark_buffer)
+                    scored, sign_model_fields, sign_recognizer = (
+                        apply_model_to_sign_result(scored, landmarks)
+                    )
                     response = {
                         "status": "received",
                         "timestamp": timestamp,
@@ -934,12 +1199,20 @@ async def landmarks_ws(websocket: WebSocket):
                         response["framing"] = scored["framing"]
                     if "classified_as" in scored:
                         response["classified_as"] = scored["classified_as"]
+                    if "motion_active" in scored:
+                        response["motion_active"] = scored["motion_active"]
+                    if "motion_energy" in scored:
+                        response["motion_energy"] = scored["motion_energy"]
+                    if "hand_style" in scored:
+                        response["hand_style"] = scored["hand_style"]
 
                     print(
                         f"[ws/landmarks] sign gesture={response.get('gesture')} "
                         f"correct={response.get('correct')} "
                         f"meaning={response.get('meaning')} "
-                        f"score={response.get('score')} reason={response.get('reason')}"
+                        f"score={response.get('score')} reason={response.get('reason')} "
+                        f"motion={response.get('motion_active')} "
+                        f"style={response.get('hand_style')}"
                     )
                     _persist_attempt(
                         session_id=session_id,
@@ -948,6 +1221,11 @@ async def landmarks_ws(websocket: WebSocket):
                         last_log_key=last_log_key,
                         last_log_mono=last_log_mono,
                     )
+
+            if mode == "sign_language":
+                response.update(
+                    ws_recognizer_fields(sign_model_fields, sign_recognizer)
+                )
 
             await websocket.send_json(response)
     except WebSocketDisconnect:

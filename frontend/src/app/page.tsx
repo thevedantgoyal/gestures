@@ -8,6 +8,36 @@ import {
 } from "@mediapipe/tasks-vision";
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
+import { SignCommunicator } from "../components/SignCommunicator";
+import { SignRulebook } from "../components/SignRulebook";
+import { SignTrainer } from "../components/SignTrainer";
+import {
+  appendSignToken,
+  composeSignSentence,
+  SENTENCE_SPEAK_IDLE_MS,
+} from "../lib/signSentence";
+import {
+  isSignTrainStats,
+  liveTestFromDebug,
+  type SignTrainStats,
+} from "../lib/signTrain";
+import {
+  drawHandOverlay,
+  isTrailMoving,
+  pushFingertipTrail,
+  pushIndexTrail,
+  TRAIL_MS,
+  type HandDrawStyle,
+  type TrailPoint,
+} from "../lib/handOverlay";
+import {
+  isClearMeaning,
+  isSignGesture,
+  SIGN_GESTURES,
+  SIGN_LABELS,
+  SIGN_MEANINGS,
+  type SignGesture,
+} from "../lib/signVocab";
 
 type Mode = "aviation" | "sign_language";
 type WsStatus =
@@ -17,13 +47,6 @@ type WsStatus =
   | "disconnected"
   | "reconnecting";
 type AviationGesture = "exit_pointing" | "seatbelt_demo";
-type SignGesture =
-  | "thumbs_up"
-  | "open_palm"
-  | "fist"
-  | "pointing"
-  | "peace_sign"
-  | "wave";
 type CalibrationGesture = AviationGesture | SignGesture;
 type CalibrationPhase =
   | "idle"
@@ -43,10 +66,9 @@ const HAND_MODEL_PATH =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 const API_BASE = "http://localhost:8000";
 const WS_URL = "ws://localhost:8000/ws/landmarks";
-const WS_SEND_INTERVAL_MS = 200;
+const WS_SEND_INTERVAL_MS = 120;
 const WRIST_VISIBILITY_THRESHOLD = 0.3;
-const SPEAK_COOLDOWN_MS = 4000;
-const SPEAK_DWELL_MS = 600;
+const SPEAK_DWELL_MS = 400;
 const AVIATION_FEEDBACK_DEBOUNCE_MS = 500;
 const RECORD_CAPTURE_INTERVAL_MS = 100;
 const WS_MAX_RECONNECT_ATTEMPTS = 5;
@@ -58,41 +80,25 @@ const RECORD_DURATION_MS: Record<CalibrationGesture, number> = {
   exit_pointing: 3000,
   seatbelt_demo: 2000,
   thumbs_up: 2500,
+  thumbs_down: 2500,
   open_palm: 2500,
   fist: 2500,
   pointing: 2500,
   peace_sign: 2500,
+  please: 2500,
+  you: 2500,
+  want: 2500,
+  okay: 2500,
+  i_love_you: 2500,
   wave: 2500,
 };
 
 const AVIATION_GESTURES: AviationGesture[] = ["exit_pointing", "seatbelt_demo"];
-const SIGN_GESTURES: SignGesture[] = [
-  "thumbs_up",
-  "open_palm",
-  "fist",
-  "pointing",
-  "peace_sign",
-  "wave",
-];
 
 const GESTURE_LABELS: Record<CalibrationGesture, string> = {
   exit_pointing: "Exit Pointing",
   seatbelt_demo: "Seatbelt Demo",
-  thumbs_up: "Thumbs Up",
-  open_palm: "Open Palm",
-  fist: "Fist",
-  pointing: "Pointing",
-  peace_sign: "Peace Sign",
-  wave: "Wave",
-};
-
-const SIGN_MEANINGS: Record<SignGesture, string> = {
-  thumbs_up: "Yes",
-  open_palm: "Hello",
-  fist: "Stop",
-  pointing: "Help",
-  peace_sign: "Thank you",
-  wave: "Goodbye",
+  ...SIGN_LABELS,
 };
 
 const LANDMARK_INDEX = {
@@ -350,38 +356,6 @@ function drawPose(
   }
 }
 
-function drawHands(
-  ctx: CanvasRenderingContext2D,
-  hands: NormalizedLandmark[][],
-  width: number,
-  height: number,
-) {
-  ctx.clearRect(0, 0, width, height);
-  ctx.strokeStyle = ACCENT;
-  ctx.fillStyle = ACCENT;
-  ctx.lineWidth = 1.5;
-  ctx.lineCap = "round";
-
-  for (const landmarks of hands) {
-    for (const connection of HandLandmarker.HAND_CONNECTIONS) {
-      const start = landmarks[connection.start];
-      const end = landmarks[connection.end];
-      if (!start || !end) continue;
-
-      ctx.beginPath();
-      ctx.moveTo(start.x * width, start.y * height);
-      ctx.lineTo(end.x * width, end.y * height);
-      ctx.stroke();
-    }
-
-    for (const landmark of landmarks) {
-      ctx.beginPath();
-      ctx.arc(landmark.x * width, landmark.y * height, 3.5, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-}
-
 const SPEECH_CLIPS: Record<string, string> = {
   Ready: "/speech/ready.wav",
   Yes: "/speech/yes.wav",
@@ -407,6 +381,55 @@ function stopSpeechPlayback() {
   speechBusy = false;
 }
 
+function stopAllSpeech() {
+  stopSpeechPlayback();
+  if (typeof window !== "undefined" && "speechSynthesis" in window) {
+    window.speechSynthesis.cancel();
+  }
+}
+
+function pickEnglishVoice(): SpeechSynthesisVoice | null {
+  if (typeof window === "undefined" || !window.speechSynthesis) return null;
+  const voices = window.speechSynthesis.getVoices();
+  if (voices.length === 0) return null;
+  return (
+    voices.find(
+      (voice) =>
+        /en-US/i.test(voice.lang) &&
+        /google|microsoft|samantha|aria|natural/i.test(voice.name),
+    ) ??
+    voices.find((voice) => /en-US/i.test(voice.lang)) ??
+    voices.find((voice) => /^en(-|$)/i.test(voice.lang)) ??
+    null
+  );
+}
+
+function speakSentence(
+  text: string,
+  hooks?: { onStart?: () => void; onEnd?: () => void },
+): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+    return speakMeaning(trimmed, hooks);
+  }
+
+  stopSpeechPlayback();
+  window.speechSynthesis.cancel();
+
+  const utterance = new SpeechSynthesisUtterance(trimmed);
+  utterance.rate = 0.92;
+  utterance.pitch = 1;
+  utterance.lang = "en-US";
+  const voice = pickEnglishVoice();
+  if (voice) utterance.voice = voice;
+  utterance.onstart = () => hooks?.onStart?.();
+  utterance.onend = () => hooks?.onEnd?.();
+  utterance.onerror = () => hooks?.onEnd?.();
+  window.speechSynthesis.speak(utterance);
+  return true;
+}
+
 async function loadSpeechBuffers(ctx: AudioContext) {
   const missing = Object.entries(SPEECH_CLIPS).filter(
     ([phrase]) => !speechBuffers.has(phrase),
@@ -422,10 +445,6 @@ async function loadSpeechBuffers(ctx: AudioContext) {
       speechBuffers.set(phrase, buffer);
     }),
   );
-}
-
-function isSpeechBusy(): boolean {
-  return speechBusy;
 }
 
 function playPhrase(
@@ -537,7 +556,17 @@ export default function Home() {
   const [voiceUnlocked, setVoiceUnlocked] = useState(false);
   const [motionProgress, setMotionProgress] = useState<number | null>(null);
   const [motionHint, setMotionHint] = useState<string | null>(null);
+  const [handStyle, setHandStyle] = useState<HandDrawStyle | null>(null);
   const [calibrationOpen, setCalibrationOpen] = useState(false);
+  const [trainOpen, setTrainOpen] = useState(false);
+  const [mlStats, setMlStats] = useState<SignTrainStats | null>(null);
+  const [trainError, setTrainError] = useState<string | null>(null);
+  const [trainBusy, setTrainBusy] = useState(false);
+  const [selectedTrainGesture, setSelectedTrainGesture] =
+    useState<SignGesture>("open_palm");
+  const [rulebookOpen, setRulebookOpen] = useState(false);
+  const [selectedRulebookGesture, setSelectedRulebookGesture] =
+    useState<SignGesture>("open_palm");
   const [calibrationPhase, setCalibrationPhase] =
     useState<CalibrationPhase>("idle");
   const [calibrationGesture, setCalibrationGesture] =
@@ -569,8 +598,14 @@ export default function Home() {
   const calibrationTokenRef = useRef(0);
   const modeRef = useRef(mode);
   modeRef.current = mode;
-  const lastSpokenRef = useRef<{ gesture: string; at: number } | null>(null);
   const pendingSpeakRef = useRef<{ gesture: string; since: number } | null>(
+    null,
+  );
+  const sentenceTokensRef = useRef<string[]>([]);
+  const lastCommittedSignRef = useRef<string | null>(null);
+  const releasedAfterCommitRef = useRef(true);
+  const [sentenceTokens, setSentenceTokens] = useState<string[]>([]);
+  const [lastSpokenSentence, setLastSpokenSentence] = useState<string | null>(
     null,
   );
   const sessionIdRef = useRef<string>("");
@@ -578,6 +613,9 @@ export default function Home() {
   const voiceUnlockedRef = useRef(false);
   voiceUnlockedRef.current = voiceUnlocked;
   const handLandmarkStructureLoggedRef = useRef(false);
+  const indexTrailRef = useRef<TrailPoint[]>([]);
+  const fingertipTrailRef = useRef<TrailPoint[]>([]);
+  const handStyleRef = useRef<HandDrawStyle | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaChunksRef = useRef<Blob[]>([]);
   const sessionTimelineRef = useRef<
@@ -597,6 +635,51 @@ export default function Home() {
   } | null>(null);
 
   const modelReady = mode === "aviation" ? poseReady : handReady;
+  const composedSentence = composeSignSentence(sentenceTokens);
+
+  function resetSentenceBuilder() {
+    sentenceTokensRef.current = [];
+    lastCommittedSignRef.current = null;
+    releasedAfterCommitRef.current = true;
+    setSentenceTokens([]);
+    setLastSpokenSentence(null);
+    setSpeaking(false);
+    stopAllSpeech();
+  }
+
+  function speakComposedSentence(text: string) {
+    const spoken = text.trim();
+    if (!spoken) return;
+    setLastSpokenSentence(spoken);
+    speakSentence(spoken, {
+      onStart: () => setSpeaking(true),
+      onEnd: () => setSpeaking(false),
+    });
+    sentenceTokensRef.current = [];
+    lastCommittedSignRef.current = null;
+    releasedAfterCommitRef.current = true;
+    setSentenceTokens([]);
+  }
+
+  useEffect(() => {
+    if (mode !== "sign_language" || !isStreaming || !voiceUnlocked) return;
+    if (sentenceTokens.length === 0) return;
+    if (speaking) return;
+    // Keep collecting signs while the current one is still locked.
+    if (gestureFeedback?.correct) return;
+    const text = composeSignSentence(sentenceTokens);
+    const timer = window.setTimeout(() => {
+      speakComposedSentence(text);
+    }, SENTENCE_SPEAK_IDLE_MS);
+    return () => window.clearTimeout(timer);
+  }, [
+    sentenceTokens,
+    mode,
+    isStreaming,
+    voiceUnlocked,
+    speaking,
+    gestureFeedback?.correct,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -677,7 +760,7 @@ export default function Home() {
       wsRef.current?.close();
       wsRef.current = null;
       if (typeof window !== "undefined") {
-        stopSpeechPlayback();
+        stopAllSpeech();
       }
     };
   }, []);
@@ -695,8 +778,8 @@ export default function Home() {
       setCoachingText(null);
       setCoachingLoading(false);
       setSpeaking(false);
-      lastSpokenRef.current = null;
       pendingSpeakRef.current = null;
+      resetSentenceBuilder();
       return;
     }
 
@@ -734,6 +817,17 @@ export default function Home() {
           dtw_distance?: number;
           coaching_text?: string | null;
           coaching_pending?: boolean;
+          motion_active?: boolean;
+          motion_energy?: number;
+          hand_style?: HandDrawStyle;
+          recognizer?: string;
+          model?: {
+            available?: boolean;
+            version?: string | null;
+            label?: string | null;
+            prob?: number | null;
+            agree?: boolean | null;
+          };
         };
 
         if (data.status === "received" && typeof data.timestamp === "number") {
@@ -746,22 +840,33 @@ export default function Home() {
         }
 
         if (
-          data.reason === "motion_buffering" &&
+          (data.reason === "motion_buffering" ||
+            data.reason === "motion_in_progress") &&
           typeof data.buffer_progress === "number"
         ) {
           setMotionProgress(
             Math.max(0, Math.min(1, data.buffer_progress)),
           );
+        } else if (
+          data.reason === "motion_in_progress" ||
+          data.reason === "motion_buffering"
+        ) {
+          setMotionProgress((prev) => prev ?? 0.45);
         } else if (data.gesture && data.gesture !== "none") {
           setMotionProgress(null);
-        } else if (data.reason !== "motion_buffering") {
+        } else if (
+          data.reason !== "motion_buffering" &&
+          data.reason !== "motion_in_progress"
+        ) {
           setMotionProgress(null);
         }
 
         if (
           typeof data.hint === "string" &&
           data.hint &&
-          data.reason === "not_recognized"
+          (data.reason === "not_recognized" ||
+            data.reason === "motion_in_progress" ||
+            data.reason === "motion_buffering")
         ) {
           setMotionHint(data.hint);
           if (motionHintTimerRef.current) {
@@ -795,21 +900,28 @@ export default function Home() {
           deviations: data.deviations ?? [],
           coaching_text: data.coaching_text ?? null,
           coaching_pending: data.coaching_pending ?? false,
+          motion_active: data.motion_active ?? null,
+          motion_energy: data.motion_energy ?? null,
+          hand_style: data.hand_style ?? null,
+          recognizer: data.recognizer ?? null,
+          model: data.model ?? null,
         });
 
         const currentMode = modeRef.current;
 
         if (currentMode === "sign_language") {
           const gesture = data.gesture ?? "none";
-          const isSign =
-            gesture === "thumbs_up" ||
-            gesture === "open_palm" ||
-            gesture === "fist" ||
-            gesture === "pointing" ||
-            gesture === "peace_sign" ||
-            gesture === "wave";
-          const isCorrect = Boolean(data.correct) && typeof data.meaning === "string";
+          const isSign = isSignGesture(gesture);
+          const isCorrect =
+            Boolean(data.correct) && typeof data.meaning === "string";
           const score = typeof data.score === "number" ? data.score : 0;
+          const keepMotionBar =
+            data.reason === "motion_buffering" ||
+            data.reason === "motion_in_progress";
+
+          if (gesture === "none") {
+            releasedAfterCommitRef.current = true;
+          }
 
           if (isSign) {
             setGestureFeedback({
@@ -820,43 +932,60 @@ export default function Home() {
             });
             setCoachingText(null);
             setCoachingLoading(false);
-            if (data.reason !== "motion_buffering") {
+            if (!keepMotionBar) {
               setMotionProgress(null);
             }
 
             if (isCorrect && typeof data.meaning === "string") {
-              const now = Date.now();
-              if (pendingSpeakRef.current?.gesture !== gesture) {
-                pendingSpeakRef.current = { gesture, since: now };
+              const skipPalmAfterWave =
+                gesture === "open_palm" &&
+                lastCommittedSignRef.current === "wave" &&
+                !releasedAfterCommitRef.current;
+              if (skipPalmAfterWave) {
+                pendingSpeakRef.current = null;
+              } else {
+                const now = Date.now();
+                if (pendingSpeakRef.current?.gesture !== gesture) {
+                  pendingSpeakRef.current = { gesture, since: now };
+                }
+                const heldMs = now - pendingSpeakRef.current.since;
+                if (
+                  heldMs >= SPEAK_DWELL_MS &&
+                  lastCommittedSignRef.current !== gesture
+                ) {
+                  lastCommittedSignRef.current = gesture;
+                  releasedAfterCommitRef.current = false;
+                  if (gesture === "fist" || isClearMeaning(data.meaning)) {
+                    resetSentenceBuilder();
+                    lastCommittedSignRef.current = "fist";
+                    setGestureFeedback({
+                      gesture: "fist",
+                      correct: true,
+                      score,
+                      meaning: "Clear",
+                    });
+                  } else {
+                    const next = appendSignToken(
+                      sentenceTokensRef.current,
+                      data.meaning,
+                    );
+                    sentenceTokensRef.current = next;
+                    setSentenceTokens(next);
+                  }
+                }
               }
-              const heldMs = now - pendingSpeakRef.current.since;
-              const last = lastSpokenRef.current;
-              const cooldownOk =
-                !last || now - last.at >= SPEAK_COOLDOWN_MS;
-              const shouldSpeak =
-                voiceUnlockedRef.current &&
-                heldMs >= SPEAK_DWELL_MS &&
-                cooldownOk &&
-                !isSpeechBusy();
-
-              if (shouldSpeak) {
-                lastSpokenRef.current = { gesture, at: now };
-                speakMeaning(data.meaning, {
-                  onStart: () => setSpeaking(true),
-                  onEnd: () => setSpeaking(false),
-                });
-              }
-            } else {
+            } else if (pendingSpeakRef.current?.gesture !== gesture) {
               pendingSpeakRef.current = null;
             }
           } else if (data.status === "received") {
+            pendingSpeakRef.current = null;
             setGestureFeedback({
               gesture: "none",
               correct: false,
               score,
               meaning: null,
             });
-            if (data.reason !== "motion_buffering") {
+            if (!keepMotionBar) {
               setMotionProgress(null);
             }
           }
@@ -1013,12 +1142,16 @@ export default function Home() {
     setSpeaking(false);
     setMotionProgress(null);
     setMotionHint(null);
+    setHandStyle(null);
+    indexTrailRef.current = [];
+    fingertipTrailRef.current = [];
+    handStyleRef.current = null;
     if (motionHintTimerRef.current) {
       clearTimeout(motionHintTimerRef.current);
       motionHintTimerRef.current = null;
     }
-    lastSpokenRef.current = null;
     pendingSpeakRef.current = null;
+    resetSentenceBuilder();
     lastDetectTimeRef.current = -1;
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
@@ -1099,7 +1232,37 @@ export default function Home() {
                     sample,
                   );
                 }
-                drawHands(ctx, [picked.landmarks], canvas.width, canvas.height);
+                const nowMs = performance.now();
+                indexTrailRef.current = pushIndexTrail(
+                  indexTrailRef.current,
+                  picked.landmarks,
+                  nowMs,
+                );
+                const moving = isTrailMoving(indexTrailRef.current);
+                if (moving) {
+                  fingertipTrailRef.current = pushFingertipTrail(
+                    fingertipTrailRef.current,
+                    picked.landmarks,
+                    nowMs,
+                  );
+                } else {
+                  fingertipTrailRef.current = fingertipTrailRef.current.filter(
+                    (point) => nowMs - point.t <= TRAIL_MS,
+                  );
+                }
+                const style: HandDrawStyle = moving ? "motion" : "hold";
+                if (handStyleRef.current !== style) {
+                  handStyleRef.current = style;
+                  setHandStyle(style);
+                }
+                drawHandOverlay(
+                  ctx,
+                  [picked.landmarks],
+                  fingertipTrailRef.current,
+                  canvas.width,
+                  canvas.height,
+                  style,
+                );
                 const handedness =
                   result.handednesses?.[picked.index]?.[0]?.categoryName ??
                   undefined;
@@ -1124,6 +1287,12 @@ export default function Home() {
                   );
                 }
               } else {
+                indexTrailRef.current = [];
+                fingertipTrailRef.current = [];
+                if (handStyleRef.current !== null) {
+                  handStyleRef.current = null;
+                  setHandStyle(null);
+                }
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
               }
             } catch {
@@ -1240,7 +1409,32 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [calibrationOpen]);
+  }, [calibrationOpen, rulebookOpen, trainOpen, isStreaming]);
+
+  useEffect(() => {
+    if (!isStreaming || mode !== "sign_language") {
+      return;
+    }
+    let cancelled = false;
+
+    fetch(`${API_BASE}/ml/stats`)
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data: unknown) => {
+        if (!cancelled && isSignTrainStats(data)) {
+          setMlStats(data);
+          setTrainError(null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setTrainError("Could not load training stats.");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [trainOpen, isStreaming, mode]);
 
   function cancelCalibration() {
     calibrationTokenRef.current += 1;
@@ -1251,23 +1445,23 @@ export default function Home() {
     setRecordProgress(0);
   }
 
-  async function runCalibration(gesture: CalibrationGesture) {
+  async function captureHold(
+    gesture: CalibrationGesture,
+  ): Promise<{ timestamp: number; landmarks: StreamLandmarks }[] | null> {
     const token = ++calibrationTokenRef.current;
     const isCurrent = () => calibrationTokenRef.current === token;
     const durationMs = RECORD_DURATION_MS[gesture];
-    const gestureType =
-      gesture === "seatbelt_demo" || gesture === "wave" ? "motion" : "pose";
 
     setCalibrationGesture(gesture);
     setCalibrationMessage(null);
     setCalibrationPhase("countdown");
 
     for (let value = 3; value >= 1; value -= 1) {
-      if (!isCurrent()) return;
+      if (!isCurrent()) return null;
       setCountdown(value);
       await sleep(1000);
     }
-    if (!isCurrent()) return;
+    if (!isCurrent()) return null;
 
     recorderRef.current = { active: true, frames: [], lastCaptureAt: 0 };
     setRecordProgress(0);
@@ -1277,7 +1471,7 @@ export default function Home() {
     for (;;) {
       if (!isCurrent()) {
         recorderRef.current.active = false;
-        return;
+        return null;
       }
       const elapsed = performance.now() - startedAt;
       setRecordProgress(Math.min(1, elapsed / durationMs));
@@ -1287,7 +1481,7 @@ export default function Home() {
 
     recorderRef.current.active = false;
     const frames = recorderRef.current.frames;
-    if (!isCurrent()) return;
+    if (!isCurrent()) return null;
 
     if (frames.length < 3) {
       setCalibrationPhase("error");
@@ -1296,8 +1490,17 @@ export default function Home() {
           ? "Not enough hand data captured — keep one hand clearly in frame."
           : "Not enough pose data captured — make sure your whole upper body is in frame.",
       );
-      return;
+      return null;
     }
+
+    return frames;
+  }
+
+  async function runCalibration(gesture: CalibrationGesture) {
+    const gestureType =
+      gesture === "seatbelt_demo" || gesture === "wave" ? "motion" : "pose";
+    const frames = await captureHold(gesture);
+    if (!frames) return;
 
     setCalibrationPhase("saving");
 
@@ -1318,7 +1521,6 @@ export default function Home() {
       }
 
       const saved = await response.json();
-      if (!isCurrent()) return;
 
       if (saved?.reference_status) {
         setReferenceStatus(saved.reference_status as ReferenceStatus);
@@ -1326,10 +1528,212 @@ export default function Home() {
       setCalibrationPhase("saved");
       setCalibrationMessage(`${GESTURE_LABELS[gesture]} reference saved ✓`);
     } catch (err) {
-      if (!isCurrent()) return;
       setCalibrationPhase("error");
       setCalibrationMessage(
         err instanceof Error ? err.message : "Could not save reference.",
+      );
+    }
+  }
+
+  async function addTrainingSamples(gesture: SignGesture) {
+    setTrainError(null);
+    const frames = await captureHold(gesture);
+    if (!frames) return;
+
+    setCalibrationPhase("saving");
+
+    try {
+      const response = await fetch(`${API_BASE}/ml/samples`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          gesture,
+          landmark_sequence: frames,
+          session_id: sessionIdRef.current || undefined,
+        }),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.detail ?? `Request failed (${response.status})`);
+      }
+
+      const saved = (await response.json()) as {
+        gold_holds?: number;
+        stats?: unknown;
+      };
+      if (isSignTrainStats(saved.stats)) {
+        setMlStats(saved.stats);
+      }
+      setCalibrationPhase("saved");
+      const holds = saved.gold_holds ?? 0;
+      const unit = gesture === "wave" ? "clips" : "holds";
+      setCalibrationMessage(
+        `${GESTURE_LABELS[gesture]}: ${holds} gold ${unit} saved. Talk still uses rules.`,
+      );
+    } catch (err) {
+      setCalibrationPhase("error");
+      const message =
+        err instanceof Error ? err.message : "Could not save training sample.";
+      setCalibrationMessage(message);
+      setTrainError(message);
+    }
+  }
+
+  async function readApiDetail(
+    response: Response,
+    fallback: string,
+  ): Promise<string> {
+    const body = (await response.json().catch(() => null)) as {
+      detail?: unknown;
+    } | null;
+    if (typeof body?.detail === "string" && body.detail) {
+      return body.detail;
+    }
+    return fallback;
+  }
+
+  async function trainSignModel() {
+    setTrainError(null);
+    setTrainBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/ml/train`, { method: "POST" });
+      if (!response.ok) {
+        throw new Error(
+          await readApiDetail(response, "Training failed."),
+        );
+      }
+      const saved = (await response.json()) as {
+        model?: { val_accuracy?: number; version?: string };
+        stats?: unknown;
+      };
+      if (isSignTrainStats(saved.stats)) {
+        setMlStats(saved.stats);
+      }
+      const accuracy =
+        typeof saved.model?.val_accuracy === "number"
+          ? Math.round(saved.model.val_accuracy * 100)
+          : null;
+      setCalibrationMessage(
+        accuracy !== null
+          ? `Trained ${saved.model?.version ?? "model"} — test accuracy ${accuracy}%. Promote to use it in Talk.`
+          : "Model trained. Promote to use it in Talk.",
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Training failed.";
+      setTrainError(message);
+    } finally {
+      setTrainBusy(false);
+    }
+  }
+
+  async function promoteSignModel() {
+    setTrainError(null);
+    setTrainBusy(true);
+    try {
+      const version = mlStats?.last_train?.version ?? mlStats?.model.version;
+      const path = version
+        ? `${API_BASE}/ml/models/${encodeURIComponent(version)}/promote`
+        : `${API_BASE}/ml/runtime`;
+      const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: version ? undefined : JSON.stringify({ source: "model" }),
+      });
+      if (!response.ok) {
+        throw new Error(
+          await readApiDetail(response, "Could not promote the model."),
+        );
+      }
+      const saved = (await response.json()) as { stats?: unknown };
+      if (isSignTrainStats(saved.stats)) {
+        setMlStats(saved.stats);
+      }
+      setCalibrationMessage(
+        "Promoted. Talk now uses the trained model for still signs.",
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Could not promote the model.";
+      setTrainError(message);
+    } finally {
+      setTrainBusy(false);
+    }
+  }
+
+  async function useRulesAgain() {
+    setTrainError(null);
+    setTrainBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/ml/runtime`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source: "heuristic" }),
+      });
+      if (!response.ok) {
+        throw new Error(
+          await readApiDetail(response, "Could not switch back to rules."),
+        );
+      }
+      const saved = (await response.json()) as { stats?: unknown };
+      if (isSignTrainStats(saved.stats)) {
+        setMlStats(saved.stats);
+      }
+      setCalibrationMessage("Talk is using hardcoded rules again.");
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Could not switch back to rules.";
+      setTrainError(message);
+    } finally {
+      setTrainBusy(false);
+    }
+  }
+
+  async function resetAllRecordedReferences() {
+    setCalibrationMessage(null);
+    try {
+      const response = await fetch(`${API_BASE}/reference/reset`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        throw new Error("Could not reset references.");
+      }
+      const data = (await response.json()) as {
+        reference_status?: ReferenceStatus;
+      };
+      if (data.reference_status) {
+        setReferenceStatus(data.reference_status);
+      }
+      setCalibrationMessage("Recorded references cleared. Using defaults.");
+    } catch (err) {
+      setCalibrationMessage(
+        err instanceof Error ? err.message : "Could not reset references.",
+      );
+    }
+  }
+
+  async function resetOneRecordedReference(gesture: CalibrationGesture) {
+    setCalibrationMessage(null);
+    try {
+      const response = await fetch(
+        `${API_BASE}/reference/${encodeURIComponent(gesture)}`,
+        { method: "DELETE" },
+      );
+      if (!response.ok) {
+        throw new Error("Could not clear this reference.");
+      }
+      const data = (await response.json()) as {
+        reference_status?: ReferenceStatus;
+      };
+      if (data.reference_status) {
+        setReferenceStatus(data.reference_status);
+      }
+      setCalibrationMessage(
+        `${GESTURE_LABELS[gesture]} is using the default again.`,
+      );
+    } catch (err) {
+      setCalibrationMessage(
+        err instanceof Error ? err.message : "Could not clear this reference.",
       );
     }
   }
@@ -1470,7 +1874,8 @@ export default function Home() {
   async function stopWebcam() {
     cancelCalibration();
     setCalibrationOpen(false);
-    stopSpeechPlayback();
+    setTrainOpen(false);
+    stopAllSpeech();
     await stopAndUploadSessionRecording();
 
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -1493,9 +1898,7 @@ export default function Home() {
         gestureFeedback.gesture in GESTURE_LABELS
         ? GESTURE_LABELS[gestureFeedback.gesture as CalibrationGesture]
         : "Exit Pointing"
-      : gestureFeedback?.meaning
-        ? gestureFeedback.meaning
-        : "Practice";
+      : composedSentence || lastSpokenSentence || "Talk with signs";
   const scorePercent =
     gestureFeedback && gestureFeedback.gesture !== "none"
       ? Math.round(Math.max(0, Math.min(1, gestureFeedback.score)) * 100)
@@ -1504,6 +1907,7 @@ export default function Home() {
     calibrationPhase === "countdown" ||
     calibrationPhase === "recording" ||
     calibrationPhase === "saving";
+  const liveTest = liveTestFromDebug(scoreDebug);
 
   if (isStreaming) {
     return (
@@ -1517,6 +1921,17 @@ export default function Home() {
           </div>
           <button
             type="button"
+            onClick={() => setRulebookOpen((open) => !open)}
+            className={`shrink-0 border px-3 py-1.5 text-xs transition-colors ${
+              rulebookOpen
+                ? "border-accent bg-accent text-white"
+                : "border-ink/20 text-muted hover:border-ink/40 hover:text-ink"
+            }`}
+          >
+            Signs
+          </button>
+          <button
+            type="button"
             onClick={() => setCalibrationOpen((open) => !open)}
             className={`shrink-0 border px-3 py-1.5 text-xs transition-colors ${
               calibrationOpen
@@ -1526,6 +1941,19 @@ export default function Home() {
           >
             Record reference
           </button>
+          {mode === "sign_language" && (
+            <button
+              type="button"
+              onClick={() => setTrainOpen((open) => !open)}
+              className={`shrink-0 border px-3 py-1.5 text-xs transition-colors ${
+                trainOpen
+                  ? "border-accent bg-accent text-white"
+                  : "border-ink/20 text-muted hover:border-ink/40 hover:text-ink"
+              }`}
+            >
+              Train model
+            </button>
+          )}
           <button
             type="button"
             onClick={stopWebcam}
@@ -1568,7 +1996,36 @@ export default function Home() {
           </div>
         </header>
 
-        <div className="flex flex-1 flex-col gap-4 p-4 lg:flex-row lg:items-start lg:gap-6 lg:p-6">
+        <div className="relative flex flex-1 flex-col gap-4 p-4 lg:flex-row lg:items-start lg:gap-6 lg:p-6">
+          {mode === "sign_language" && !rulebookOpen && (
+            <button
+              type="button"
+              onClick={() => setRulebookOpen(true)}
+              className="absolute left-0 top-28 z-20 border border-l-0 border-ink/20 bg-surface px-2 py-8 text-xs font-medium tracking-wide text-ink shadow-sm hover:bg-accent hover:text-white lg:top-24"
+            >
+              Signs
+            </button>
+          )}
+          {mode === "sign_language" && (
+            <SignRulebook
+              open={rulebookOpen}
+              selectedGesture={selectedRulebookGesture}
+              referenceStatus={referenceStatus}
+              recordBusy={calibrationBusy}
+              onClose={() => setRulebookOpen(false)}
+              onSelect={setSelectedRulebookGesture}
+              onRecord={(gesture) => {
+                setCalibrationOpen(true);
+                void runCalibration(gesture);
+              }}
+              onResetOne={(gesture) => {
+                void resetOneRecordedReference(gesture);
+              }}
+              onResetAll={() => {
+                void resetAllRecordedReferences();
+              }}
+            />
+          )}
           <div className="relative flex min-w-0 w-full flex-1 items-center justify-center">
             <div className="hud-frame relative aspect-video w-full max-w-[min(90vw,calc((100vh-7.5rem)*16/9))] max-h-[calc(100vh-7.5rem)] bg-ink lg:w-[min(85vw,calc((100vh-7.5rem)*16/9))]">
               <div className="hud-corners" aria-hidden />
@@ -1623,7 +2080,33 @@ export default function Home() {
             </div>
           </div>
 
-          <aside className="flex w-full shrink-0 flex-col gap-4 lg:w-80 xl:w-96">
+          <aside className="flex w-full shrink-0 flex-col gap-4 lg:w-96 xl:w-[26rem]">
+            {mode === "sign_language" && (
+              <SignTrainer
+                open={trainOpen}
+                stats={mlStats}
+                selectedGesture={selectedTrainGesture}
+                recordBusy={calibrationBusy}
+                trainBusy={trainBusy}
+                error={trainError}
+                liveTest={liveTest}
+                onClose={() => setTrainOpen(false)}
+                onSelect={setSelectedTrainGesture}
+                onAddSamples={(gesture) => {
+                  setSelectedTrainGesture(gesture);
+                  void addTrainingSamples(gesture);
+                }}
+                onTrain={() => {
+                  void trainSignModel();
+                }}
+                onPromote={() => {
+                  void promoteSignModel();
+                }}
+                onUseRules={() => {
+                  void useRulesAgain();
+                }}
+              />
+            )}
             {calibrationOpen && (
               <div className="border-2 border-accent/50 bg-surface p-5">
                 <div className="flex items-start justify-between gap-3">
@@ -1698,6 +2181,15 @@ export default function Home() {
                   ))}
                 </div>
 
+                <button
+                  type="button"
+                  onClick={() => void resetAllRecordedReferences()}
+                  disabled={calibrationBusy}
+                  className="mt-3 min-h-11 w-full border border-ink/20 px-3 py-2 text-sm text-ink disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Clear all recorded references
+                </button>
+
                 {calibrationPhase === "recording" && (
                   <div className="mt-4">
                     <div className="mb-1.5 flex items-center justify-between text-xs">
@@ -1736,114 +2228,52 @@ export default function Home() {
               </div>
             )}
 
+            {mode === "sign_language" ? (
+              <SignCommunicator
+                voiceUnlocked={voiceUnlocked}
+                speaking={speaking}
+                tokens={sentenceTokens}
+                sentence={composedSentence}
+                lastSpoken={lastSpokenSentence}
+                currentMeaning={
+                  gestureFeedback?.correct ? (gestureFeedback.meaning ?? null) : null
+                }
+                currentLabel={
+                  gestureFeedback &&
+                  gestureFeedback.gesture !== "none" &&
+                  gestureFeedback.gesture in GESTURE_LABELS
+                    ? GESTURE_LABELS[gestureFeedback.gesture as CalibrationGesture]
+                    : null
+                }
+                recognized={Boolean(gestureFeedback?.correct)}
+                scorePercent={scorePercent}
+                motionProgress={motionProgress}
+                motionHint={motionHint}
+                handStyle={handStyle}
+                onEnableVoice={() => {
+                  setVoiceUnlocked(true);
+                  if (typeof window !== "undefined" && "speechSynthesis" in window) {
+                    window.speechSynthesis.getVoices();
+                  }
+                  unlockSpeechSynthesis({
+                    onStart: () => setSpeaking(true),
+                    onEnd: () => setSpeaking(false),
+                  });
+                }}
+                onSpeak={() => speakComposedSentence(composedSentence)}
+                onRepeat={() => {
+                  if (!lastSpokenSentence) return;
+                  speakSentence(lastSpokenSentence, {
+                    onStart: () => setSpeaking(true),
+                    onEnd: () => setSpeaking(false),
+                  });
+                }}
+                onClear={resetSentenceBuilder}
+              />
+            ) : (
             <div className="border border-ink/15 bg-surface p-5">
               <p className="text-xs text-muted">Current result</p>
-
-              {mode === "sign_language" && isStreaming && !voiceUnlocked && (
-                <div className="mt-3 border border-accent/30 bg-accent/5 px-3 py-3">
-                  <p className="text-sm text-ink">
-                    Spoken feedback needs a one-time click to unlock audio.
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setVoiceUnlocked(true);
-                      unlockSpeechSynthesis({
-                        onStart: () => setSpeaking(true),
-                        onEnd: () => setSpeaking(false),
-                      });
-                    }}
-                    className="mt-2 border border-accent px-3 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent hover:text-white"
-                  >
-                    Click to enable spoken feedback
-                  </button>
-                </div>
-              )}
-
-              {motionProgress !== null && (
-                <div className="mt-4">
-                  <div className="mb-1.5 flex items-center justify-between text-xs">
-                    <span className="text-accent">Reading motion…</span>
-                    <span className="tabular-nums text-muted">
-                      {Math.round(motionProgress * 100)}%
-                    </span>
-                  </div>
-                  <div className="h-1.5 w-full bg-ink/10">
-                    <div
-                      className="h-full bg-accent transition-[width] duration-200"
-                      style={{
-                        width: `${Math.round(motionProgress * 100)}%`,
-                      }}
-                    />
-                  </div>
-                </div>
-              )}
-
-              {motionHint && (
-                <p className="mt-3 text-sm text-accent">{motionHint}</p>
-              )}
-
-              {mode === "sign_language" ? (
-                !gestureFeedback || gestureFeedback.gesture === "none" ? (
-                  <div className="mt-3">
-                    <h2 className="font-heading text-2xl font-medium text-muted">
-                      Show me a sign
-                    </h2>
-                    <p className="mt-2 text-sm text-muted">
-                      Hold an open palm, thumbs up, fist, point, peace, or wave
-                      clearly in frame.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="mt-3">
-                    <p className="text-xs text-muted">
-                      {
-                        GESTURE_LABELS[
-                          gestureFeedback.gesture as CalibrationGesture
-                        ]
-                      }
-                    </p>
-                    <div
-                      className={`mt-3 inline-block px-4 py-2 text-sm font-medium text-white ${
-                        gestureFeedback.correct ? "bg-success" : "bg-alert"
-                      }`}
-                    >
-                      {gestureFeedback.correct ? "Correct" : "Incorrect"}
-                    </div>
-                    {gestureFeedback.correct && gestureFeedback.meaning ? (
-                      <h2 className="font-heading mt-3 text-4xl font-medium text-ink">
-                        {gestureFeedback.meaning}
-                      </h2>
-                    ) : (
-                      <p className="mt-3 text-sm text-muted">
-                        Keep holding — match needs to be clearer
-                        {scorePercent > 0 ? ` (${scorePercent}%)` : ""}.
-                      </p>
-                    )}
-                    <div className="mt-5">
-                      <div className="mb-2 flex items-center justify-between text-sm">
-                        <span className="text-muted">Confidence</span>
-                        <span className="font-medium text-ink">
-                          {scorePercent}%
-                        </span>
-                      </div>
-                      <div className="h-2 w-full bg-ink/10">
-                        <div
-                          className={`h-full transition-[width] duration-300 ${
-                            gestureFeedback.correct ? "bg-success" : "bg-accent"
-                          }`}
-                          style={{ width: `${scorePercent}%` }}
-                        />
-                      </div>
-                    </div>
-                    {speaking && (
-                      <p className="mt-4 text-xs font-medium text-accent">
-                        Speak…
-                      </p>
-                    )}
-                  </div>
-                )
-              ) : !gestureFeedback ? (
+              {!gestureFeedback ? (
                 <p className="mt-3 text-sm leading-relaxed text-muted">
                   Move into Exit Pointing or Seatbelt Demo. Feedback appears
                   while you are actively training — not while standing still.
@@ -1954,6 +2384,7 @@ export default function Home() {
                 </>
               )}
             </div>
+            )}
 
             <div className="border border-ink/15 bg-surface">
               <button
@@ -2053,7 +2484,8 @@ export default function Home() {
               Sign Language
             </span>
             <span className="mt-2 block text-sm leading-relaxed text-muted">
-              Learn and recognize common signs through live camera feedback.
+              Show signs one after another. They become a sentence, then the
+              computer speaks it out loud.
             </span>
           </button>
         </div>

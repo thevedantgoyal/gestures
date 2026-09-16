@@ -1,0 +1,13 @@
+---
+description: Sign-language AAC product context, training/Postgres flow, and user constraints for this repo.
+alwaysApply: true
+---
+
+# Gesture project context
+
+Read root `AGENTS.md` before changing sign recognition, training, or Postgres.
+
+- Talk uses hardcoded heuristics until the user **Promotes** a trained model.
+- Add samples writes immediately to Postgres table `training_samples` (column `name` = Yes/Hello/Clear). Do not write gold holds to `samples.jsonl`.
+- Fist = Clear sentence. Thumbs up = Yes. Still palm = Hello. Wave motion = Goodbye.
+- Signs UI stays on the left. Do not commit `backend/.env`.

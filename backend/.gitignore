@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .env
 recordings/
+app/ml/data/*.jsonl
+app/ml/data/*.imported
+app/ml/models/*.joblib
+app/ml/models/*.json
+app/ml/models/*.imported
+app/scoring/*.imported

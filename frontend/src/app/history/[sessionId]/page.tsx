@@ -4,17 +4,14 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { SIGN_LABELS } from "../../../lib/signVocab";
+
 const API_BASE = "http://localhost:8000";
 
 const GESTURE_LABELS: Record<string, string> = {
   exit_pointing: "Exit Pointing",
   seatbelt_demo: "Seatbelt Demo",
-  thumbs_up: "Thumbs Up",
-  open_palm: "Open Palm",
-  fist: "Fist",
-  pointing: "Pointing",
-  peace_sign: "Peace Sign",
-  wave: "Wave",
+  ...SIGN_LABELS,
 };
 
 type Attempt = {

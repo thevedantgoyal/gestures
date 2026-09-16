@@ -14,7 +14,8 @@ const spaceGrotesk = Space_Grotesk({
 
 export const metadata: Metadata = {
   title: "AI Gesture Recognition Platform",
-  description: "Aviation training and sign language gesture recognition",
+  description:
+    "Aviation training and sign language communication — signs become spoken sentences",
   icons: {
     icon: [{ url: "/favicon.svg", type: "image/svg+xml" }],
   },
