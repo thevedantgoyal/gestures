@@ -39,6 +39,8 @@ function clauseFor(meaning: SignMeaning): string {
       return "I love you";
     case "Clear":
       return "";
+    case "Undo":
+      return "";
     default: {
       const exhaustive: never = meaning;
       return exhaustive;
@@ -129,7 +131,14 @@ export function appendSignToken(
   meaning: string,
 ): string[] {
   if (meaning === "Clear") return [];
+  if (meaning === "Undo") return undoLastSignToken(tokens);
   if (!isSignMeaning(meaning)) return [...tokens];
   if (tokens.length >= MAX_SENTENCE_TOKENS) return [...tokens];
   return [...tokens, meaning];
+}
+
+/** Remove only the last signed word. Clear still wipes everything. */
+export function undoLastSignToken(tokens: readonly string[]): string[] {
+  if (tokens.length === 0) return [];
+  return tokens.slice(0, -1);
 }

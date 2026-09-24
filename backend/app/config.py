@@ -29,3 +29,9 @@ BEDROCK_REGION = os.environ.get("AWS_REGION") or os.environ.get(
 BEDROCK_MODEL_ID = os.environ.get(
     "BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"
 )
+
+# Local / LAN Ollama (OpenAI-compatible) for AAC sentence polish.
+_raw_ollama = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1/").strip()
+OLLAMA_BASE_URL = _raw_ollama.rstrip("/") + "/" if _raw_ollama else ""
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:latest")
+OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "45"))

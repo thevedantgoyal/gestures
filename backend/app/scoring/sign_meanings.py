@@ -7,6 +7,7 @@ SIGN_MEANINGS: dict[str, str] = {
     "thumbs_down": "No",
     "open_palm": "Hello",
     "fist": "Clear",
+    "four": "Undo",
     "pointing": "Help",
     "peace_sign": "Thank you",
     "please": "Please",

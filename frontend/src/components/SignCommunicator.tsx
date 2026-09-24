@@ -3,6 +3,7 @@
 type SignCommunicatorProps = {
   voiceUnlocked: boolean;
   speaking: boolean;
+  polishing?: boolean;
   tokens: string[];
   sentence: string;
   lastSpoken: string | null;
@@ -15,6 +16,7 @@ type SignCommunicatorProps = {
   handStyle: "motion" | "hold" | null;
   onEnableVoice: () => void;
   onSpeak: () => void;
+  onUndo: () => void;
   onRepeat: () => void;
   onClear: () => void;
 };
@@ -22,6 +24,7 @@ type SignCommunicatorProps = {
 export function SignCommunicator({
   voiceUnlocked,
   speaking,
+  polishing = false,
   tokens,
   sentence,
   lastSpoken,
@@ -34,72 +37,89 @@ export function SignCommunicator({
   handStyle,
   onEnableVoice,
   onSpeak,
+  onUndo,
   onRepeat,
   onClear,
 }: SignCommunicatorProps) {
   const displaySentence = sentence || lastSpoken;
-  const canSpeak = Boolean(sentence) && voiceUnlocked && !speaking;
-  const canRepeat = Boolean(lastSpoken) && voiceUnlocked && !speaking;
+  const busy = speaking || polishing;
+  const canSpeak = Boolean(sentence) && voiceUnlocked && !busy;
+  const canUndo = tokens.length > 0 && !busy;
+  const canRepeat = Boolean(lastSpoken) && voiceUnlocked && !busy;
   const moving = handStyle === "motion";
   const seeingTitle = recognized
-    ? "Locked"
+    ? "Locked in"
     : moving
       ? "Reading motion"
       : currentLabel
         ? "Hold still"
-        : "Now seeing";
+        : "Ready for a sign";
   const seeingDetail =
     recognized && currentMeaning === "Clear"
       ? "Sentence cleared. Start a new one."
-      : recognized && currentMeaning
-        ? currentMeaning
-        : moving
-          ? "Dots follow your fingers."
-          : currentLabel
-            ? "Hold still to lock the word"
-            : "Hold a still open palm for Hello. A closed fist clears the sentence. Wag left and right twice for Goodbye.";
+      : recognized && currentMeaning === "Undo"
+        ? "Last word removed."
+        : recognized && currentMeaning
+          ? currentMeaning
+          : moving
+            ? "Dots follow your fingers — keep wagging for Goodbye."
+            : currentLabel
+              ? "Hold still to lock the word"
+              : "Palm+thumb = Hello · 4 fingers = Undo · Fist = Clear";
 
   return (
     <section
-      className="flex flex-col gap-4"
+      className="fade-up flex flex-col gap-4"
       aria-label="Sign language communicator"
     >
       {!voiceUnlocked && (
-        <div className="border border-accent/30 bg-accent/5 px-4 py-4">
-          <p className="text-base text-ink">
-            Tap once so the computer can speak your sentence out loud.
+        <div className="panel border-accent/25 bg-accent-soft/60 px-5 py-5">
+          <p className="soft-label text-accent-deep">One tap first</p>
+          <p className="mt-2 text-base leading-relaxed text-ink">
+            Allow voice so your sentence can be spoken out loud.
           </p>
           <button
             type="button"
             onClick={onEnableVoice}
-            className="mt-3 min-h-12 bg-accent px-5 py-3 text-sm font-medium text-white transition-colors hover:brightness-95"
+            className="btn-primary mt-4"
           >
             Enable voice
           </button>
         </div>
       )}
 
-      <div className="border border-ink/15 bg-surface p-5">
-        <p className="text-xs font-medium uppercase tracking-wide text-muted">
-          Your sentence
-        </p>
+      <div className="panel p-5 sm:p-6">
+        <div className="flex items-center justify-between gap-3">
+          <p className="soft-label">Your sentence</p>
+          {polishing ? (
+            <span className="pulse-soft text-sm font-semibold text-accent">
+              Polishing…
+            </span>
+          ) : speaking ? (
+            <span className="pulse-soft text-sm font-semibold text-accent">
+              Speaking…
+            </span>
+          ) : null}
+        </div>
         <p
-          className="font-heading mt-3 min-h-[3.5rem] text-3xl font-medium leading-snug text-ink sm:text-4xl"
+          className="font-heading mt-3 min-h-[3.75rem] text-3xl font-medium leading-snug text-ink sm:text-[2.35rem]"
           aria-live="assertive"
           aria-atomic="true"
         >
-          {displaySentence ?? "Show a sign to start talking"}
+          {displaySentence ?? "Show a sign to begin"}
         </p>
-        {speaking && (
-          <p className="mt-3 text-sm font-medium text-accent">Speaking…</p>
-        )}
 
         {tokens.length > 0 && (
-          <ul className="mt-4 flex flex-wrap gap-2" aria-label="Words in this sentence">
+          <ul
+            className="mt-4 flex flex-wrap gap-2"
+            aria-label="Words in this sentence"
+          >
             {tokens.map((token, index) => (
               <li
                 key={`${token}-${index}`}
-                className="border border-accent/30 bg-accent/10 px-3 py-1.5 text-sm font-medium text-accent"
+                className={`chip ${
+                  index === tokens.length - 1 ? "ring-1 ring-accent/40" : ""
+                }`}
               >
                 {token}
               </li>
@@ -107,20 +127,28 @@ export function SignCommunicator({
           </ul>
         )}
 
-        <div className="mt-5 grid grid-cols-3 gap-2">
+        <div className="mt-5 grid grid-cols-2 gap-2.5 sm:grid-cols-4">
           <button
             type="button"
             onClick={onSpeak}
             disabled={!canSpeak}
-            className="min-h-12 bg-accent px-3 py-3 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
+            className="btn-primary"
           >
-            Speak
+            {polishing ? "Polishing…" : "Speak"}
+          </button>
+          <button
+            type="button"
+            onClick={onUndo}
+            disabled={!canUndo}
+            className="btn-secondary"
+          >
+            Undo last
           </button>
           <button
             type="button"
             onClick={onRepeat}
             disabled={!canRepeat}
-            className="min-h-12 border border-ink/20 px-3 py-3 text-sm font-medium text-ink disabled:cursor-not-allowed disabled:opacity-40"
+            className="btn-secondary"
           >
             Say again
           </button>
@@ -128,21 +156,19 @@ export function SignCommunicator({
             type="button"
             onClick={onClear}
             disabled={tokens.length === 0 && !lastSpoken}
-            className="min-h-12 border border-ink/20 px-3 py-3 text-sm font-medium text-ink disabled:cursor-not-allowed disabled:opacity-40"
+            className="btn-secondary"
           >
             Clear
           </button>
         </div>
       </div>
 
-      <div className="border border-ink/15 bg-surface p-5">
-        <p className="text-xs font-medium uppercase tracking-wide text-muted">
-          {seeingTitle}
-        </p>
+      <div className="panel p-5 sm:p-6">
+        <p className="soft-label">{seeingTitle}</p>
         {motionProgress !== null && (
           <div className="mt-3">
             <div className="mb-1.5 flex items-center justify-between text-xs">
-              <span className="text-accent">
+              <span className="font-medium text-accent">
                 {moving && currentLabel === "Wave"
                   ? "Watching the wag…"
                   : "Reading motion…"}
@@ -151,28 +177,34 @@ export function SignCommunicator({
                 {Math.round(motionProgress * 100)}%
               </span>
             </div>
-            <div className="h-1.5 w-full bg-ink/10">
+            <div className="progress-track">
               <div
-                className="h-full bg-accent transition-[width] duration-200"
+                className="progress-fill bg-accent"
                 style={{ width: `${Math.round(motionProgress * 100)}%` }}
               />
             </div>
           </div>
         )}
-        {motionHint && <p className="mt-3 text-sm text-accent">{motionHint}</p>}
+        {motionHint && (
+          <p className="mt-3 text-sm font-medium text-accent">{motionHint}</p>
+        )}
         {currentLabel ? (
           <>
             <p className="mt-2 text-sm text-muted">{currentLabel}</p>
             <p
               className={`font-heading mt-1 text-2xl font-medium ${
-                recognized ? "text-success" : moving ? "text-accent" : "text-muted"
+                recognized
+                  ? "text-success"
+                  : moving
+                    ? "text-accent"
+                    : "text-ink-soft"
               }`}
             >
               {seeingDetail}
             </p>
-            <div className="mt-3 h-2 w-full bg-ink/10">
+            <div className="progress-track mt-4">
               <div
-                className={`h-full transition-[width] duration-300 ${
+                className={`progress-fill ${
                   recognized ? "bg-success" : "bg-accent"
                 }`}
                 style={{ width: `${scorePercent}%` }}
@@ -180,10 +212,11 @@ export function SignCommunicator({
             </div>
           </>
         ) : (
-          <p className="mt-2 text-base text-muted">{seeingDetail}</p>
+          <p className="mt-3 text-base leading-relaxed text-muted">
+            {seeingDetail}
+          </p>
         )}
       </div>
-
     </section>
   );
 }

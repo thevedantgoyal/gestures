@@ -48,6 +48,7 @@ from app.scoring.engine import (
     is_aviation_idle,
     score_motion,
     score_pose,
+    select_primary_hand,
     wrist_visibility,
 )
 from app.scoring.reference_gestures import (
@@ -84,7 +85,9 @@ from app.ml.registry import RegistryError, latest_meta, list_versions, read_meta
 from app.ml.runtime import get_runtime, load_runtime, ws_recognizer_fields
 from app.ml.train import TrainError, train_sign_classifier
 from app.scoring.sign_meanings import SIGN_MEANINGS
+from app.scoring.sign_stability import SignStabilizer
 from app.services.coaching import get_coaching_text
+from app.services.sentence_polish import polish_sentence_with_ollama
 from app.sessions import (
     get_session_attempts,
     get_session_recording_meta,
@@ -152,6 +155,11 @@ class SampleRecordRequest(BaseModel):
 class RuntimeUpdateRequest(BaseModel):
     source: Literal["heuristic", "model"]
     version: str | None = None
+
+
+class PolishSentenceRequest(BaseModel):
+    tokens: list[str] = Field(default_factory=list)
+    fallback: str = ""
 
 
 @app.get("/health")
@@ -524,6 +532,21 @@ def ml_promote(version: str):
     }
 
 
+@app.post("/ml/polish-sentence")
+def ml_polish_sentence(request: PolishSentenceRequest):
+    """Rewrite signed words into one spoken sentence via Ollama (template fallback)."""
+    tokens = [str(item).strip() for item in request.tokens if str(item).strip()]
+    fallback = (request.fallback or "").strip()
+    result = polish_sentence_with_ollama(tokens, fallback=fallback)
+    return {
+        "status": "ok",
+        "sentence": result.get("sentence") or fallback,
+        "source": result.get("source") or "fallback",
+        "detail": result.get("detail"),
+        "tokens": tokens,
+    }
+
+
 @app.post("/ml/samples")
 def ml_add_samples(request: SampleRecordRequest):
     """Append one confirmed hold to PostgreSQL. Does not change Talk."""
@@ -749,6 +772,7 @@ def _evaluate_aviation(
 def _evaluate_sign_language(
     landmarks: dict[str, Any],
     buffer: deque[dict[str, Any]],
+    stabilizer: SignStabilizer | None = None,
 ) -> dict[str, Any]:
     """Recognize a sign — always return live feedback; speak only when matched."""
     framing = assess_hand_framing(landmarks)
@@ -769,6 +793,21 @@ def _evaluate_sign_language(
         "hand_style": hand_style,
     }
 
+    if not framing.get("ok"):
+        if stabilizer is not None:
+            stabilizer.update("none", 0.0, None)
+        return {
+            "gesture": "none",
+            "correct": False,
+            "score": 0.0,
+            "reason": "low_visibility",
+            "framing": framing,
+            "scores": {},
+            "attempted_gesture": None,
+            "deviations": [],
+            **motion_meta,
+        }
+
     attempt = classify_gesture_attempt(
         landmarks, mode="sign_language", buffer=frames
     )
@@ -780,19 +819,6 @@ def _evaluate_sign_language(
     )
     print(f"[sign_scores] {pose_scores} best={best_gesture}:{best_score}")
 
-    if not framing.get("ok"):
-        return {
-            "gesture": "none",
-            "correct": False,
-            "score": float(best_score or 0.0),
-            "reason": "low_visibility",
-            "framing": framing,
-            "scores": pose_scores,
-            "attempted_gesture": best_gesture or attempt,
-            "deviations": pose_detail.get("deviations", []),
-            **motion_meta,
-        }
-
     if attempt == "wave":
         motion_result = score_motion(frames, get_reference("wave"))
         wave_score = float(motion_result.get("score") or 0.0)
@@ -800,11 +826,46 @@ def _evaluate_sign_language(
         wag = buffer_looks_like_wave(frames)
         # A held palm is Hello. Goodbye only after a real left-right wag.
         if wag:
+            stable_score = max(wave_score, 0.78)
+            if stabilizer is not None:
+                decision = stabilizer.update("wave", stable_score, scores)
+                if decision.get("stable") and decision.get("label") == "wave":
+                    return {
+                        "gesture": "wave",
+                        "correct": True,
+                        "meaning": SIGN_MEANINGS["wave"],
+                        "score": float(decision.get("score") or stable_score),
+                        "reason": None,
+                        "attempted_gesture": "wave",
+                        "hint": None,
+                        "dtw_distance": motion_result.get("dtw_distance"),
+                        "buffer_progress": 1.0,
+                        "scores": scores,
+                        "deviations": motion_result.get("deviations", []),
+                        "framing": framing,
+                        "stability": decision,
+                        **motion_meta,
+                    }
+                return {
+                    "gesture": "wave",
+                    "correct": False,
+                    "score": stable_score,
+                    "meaning": None,
+                    "reason": "stabilizing",
+                    "attempted_gesture": "wave",
+                    "buffer_progress": 0.85,
+                    "scores": scores,
+                    "deviations": motion_result.get("deviations", []),
+                    "framing": framing,
+                    "hint": "Hold the wag a moment longer",
+                    "stability": decision,
+                    **motion_meta,
+                }
             return {
                 "gesture": "wave",
                 "correct": True,
                 "meaning": SIGN_MEANINGS["wave"],
-                "score": max(wave_score, 0.72),
+                "score": stable_score,
                 "reason": None,
                 "attempted_gesture": "wave",
                 "hint": None,
@@ -818,6 +879,8 @@ def _evaluate_sign_language(
         progress = motion_result.get("buffer_progress", 0.0)
         if motion_active:
             progress = max(float(progress or 0.0), 0.4)
+        if stabilizer is not None:
+            stabilizer.update("none", 0.0, scores)
         return {
             "gesture": "wave",
             "correct": False,
@@ -835,11 +898,37 @@ def _evaluate_sign_language(
             **motion_meta,
         }
 
+    # Moving open palm without a confirmed wag must not lock Hello.
+    if (
+        attempt == "open_palm"
+        and motion_active
+        and not buffer_looks_like_wave(frames)
+    ):
+        if stabilizer is not None:
+            stabilizer.update("none", 0.0, pose_scores)
+        return {
+            "gesture": "none",
+            "correct": False,
+            "score": float(pose_scores.get("open_palm") or 0.0),
+            "reason": "motion_hold",
+            "attempted_gesture": "open_palm",
+            "scores": pose_scores,
+            "framing": framing,
+            "hint": "Hold still for Hello, or wag for Goodbye",
+            **motion_meta,
+        }
+
     display_gesture = best_gesture
     if attempt == "fist":
         display_gesture = "fist"
         best_score = max(
             float(pose_scores.get("fist") or 0.0),
+            SIGN_RECOGNITION_THRESHOLD + 0.08,
+        )
+    elif attempt == "four":
+        display_gesture = "four"
+        best_score = max(
+            float(pose_scores.get("four") or 0.0),
             SIGN_RECOGNITION_THRESHOLD + 0.08,
         )
     elif attempt == "thumbs_up":
@@ -857,9 +946,62 @@ def _evaluate_sign_language(
         display_gesture = attempt
         best_score = float(pose_scores.get(attempt, best_score))
 
-    matched = bool(display_gesture and best_score >= SIGN_RECOGNITION_THRESHOLD)
+    raw_matched = bool(
+        display_gesture and best_score >= SIGN_RECOGNITION_THRESHOLD
+    )
+    candidate = display_gesture if raw_matched else "none"
+    candidate_score = float(best_score or 0.0) if raw_matched else 0.0
 
-    if matched:
+    decision = None
+    if stabilizer is not None:
+        decision = stabilizer.update(candidate, candidate_score, pose_scores)
+        stable_label = str(decision.get("label") or "none")
+        stable_score = float(decision.get("score") or 0.0)
+        if decision.get("stable") and stable_label not in ("none", "wave"):
+            return {
+                "gesture": stable_label,
+                "correct": True,
+                "meaning": SIGN_MEANINGS.get(stable_label),
+                "score": max(stable_score, SIGN_RECOGNITION_THRESHOLD),
+                "scores": pose_scores,
+                "classified_as": attempt,
+                "deviations": pose_detail.get("deviations", []),
+                "framing": framing,
+                "stability": decision,
+                **motion_meta,
+            }
+        if stable_label not in ("none", "wave") and stable_score >= SIGN_ATTEMPT_FEEDBACK_THRESHOLD:
+            return {
+                "gesture": stable_label,
+                "correct": False,
+                "meaning": None,
+                "score": stable_score,
+                "reason": "stabilizing" if decision.get("reason") in ("candidate", "warming", "unstable") else "not_recognized",
+                "attempted_gesture": stable_label,
+                "scores": pose_scores,
+                "classified_as": attempt,
+                "deviations": pose_detail.get("deviations", []),
+                "framing": framing,
+                "stability": decision,
+                **motion_meta,
+            }
+        return {
+            "gesture": "none",
+            "correct": False,
+            "score": candidate_score,
+            "reason": "stabilizing" if candidate != "none" else (
+                "not_recognized" if display_gesture else "no_attempt"
+            ),
+            "attempted_gesture": display_gesture or attempt,
+            "scores": pose_scores,
+            "classified_as": attempt,
+            "deviations": pose_detail.get("deviations", []),
+            "framing": framing,
+            "stability": decision,
+            **motion_meta,
+        }
+
+    if raw_matched:
         return {
             "gesture": display_gesture,
             "correct": True,
@@ -987,6 +1129,7 @@ async def landmarks_ws(websocket: WebSocket):
 
     landmark_buffer: deque[dict[str, Any]] = deque(maxlen=BUFFER_MAX_FRAMES)
     aviation_hold: dict[str, Any] = {"gesture": None, "frames": 0}
+    sign_stabilizer = SignStabilizer()
     last_coaching_mono = 0.0
     last_coaching_text: str | None = None
     coaching_in_flight = False
@@ -1010,6 +1153,12 @@ async def landmarks_ws(websocket: WebSocket):
             timestamp = message.get("timestamp")
             mode = message.get("mode")
             landmarks = message.get("landmarks") or {}
+            hands_payload = message.get("hands")
+            hand_select_meta: dict[str, Any] | None = None
+            if isinstance(hands_payload, list) and hands_payload:
+                primary, hand_select_meta = select_primary_hand(hands_payload)
+                if primary is not None:
+                    landmarks = primary
             client_session = message.get("session_id")
             session_id = (
                 str(client_session)
@@ -1021,6 +1170,7 @@ async def landmarks_ws(websocket: WebSocket):
                 landmark_buffer.clear()
                 aviation_hold["gesture"] = None
                 aviation_hold["frames"] = 0
+                sign_stabilizer.reset()
                 last_coaching_text = None
                 last_mode = mode if isinstance(mode, str) else None
 
@@ -1165,7 +1315,9 @@ async def landmarks_ws(websocket: WebSocket):
                         await websocket.send_json(response)
                         continue
 
-                    scored = _evaluate_sign_language(landmarks, landmark_buffer)
+                    scored = _evaluate_sign_language(
+                        landmarks, landmark_buffer, stabilizer=sign_stabilizer
+                    )
                     scored, sign_model_fields, sign_recognizer = (
                         apply_model_to_sign_result(scored, landmarks)
                     )
@@ -1205,6 +1357,10 @@ async def landmarks_ws(websocket: WebSocket):
                         response["motion_energy"] = scored["motion_energy"]
                     if "hand_style" in scored:
                         response["hand_style"] = scored["hand_style"]
+                    if "stability" in scored:
+                        response["stability"] = scored["stability"]
+                    if hand_select_meta is not None:
+                        response["hands"] = hand_select_meta
 
                     print(
                         f"[ws/landmarks] sign gesture={response.get('gesture')} "
@@ -1212,7 +1368,9 @@ async def landmarks_ws(websocket: WebSocket):
                         f"meaning={response.get('meaning')} "
                         f"score={response.get('score')} reason={response.get('reason')} "
                         f"motion={response.get('motion_active')} "
-                        f"style={response.get('hand_style')}"
+                        f"style={response.get('hand_style')} "
+                        f"hands={hand_select_meta} "
+                        f"stable={(scored.get('stability') or {}).get('reason')}"
                     )
                     _persist_attempt(
                         session_id=session_id,

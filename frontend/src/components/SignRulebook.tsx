@@ -39,29 +39,26 @@ export function SignRulebook({
 
   return (
     <aside
-      className="absolute left-0 top-0 z-20 flex max-h-[calc(100vh-8rem)] w-[min(100%,20rem)] flex-col overflow-y-auto border border-l-0 border-ink/15 bg-surface shadow-sm"
+      className="panel absolute left-0 top-0 z-20 flex max-h-[calc(100vh-7rem)] w-[min(100%,21rem)] flex-col overflow-hidden rounded-l-none border-l-0"
       aria-label="Sign rulebook"
     >
-      <div className="flex shrink-0 items-start justify-between gap-3 border-b border-ink/10 px-5 py-4">
+      <div className="flex shrink-0 items-start justify-between gap-3 border-b border-ink/8 px-5 py-4">
         <div>
-          <h2 className="font-heading text-lg font-medium text-ink">
-            Signs you can use
-          </h2>
+          <h2 className="font-heading text-xl font-medium text-ink">Signs</h2>
           <p className="mt-1 text-xs leading-relaxed text-muted">
-            Tap a sign to see how to do it. Record your own hand if the default
-            does not match you.
+            Tap a word, follow the steps, then show it to the camera.
           </p>
         </div>
         <button
           type="button"
           onClick={onClose}
-          className="shrink-0 text-xs text-muted hover:text-ink"
+          className="nav-pill shrink-0 !px-3 !py-1.5"
         >
           Close
         </button>
       </div>
 
-      <ul className="grid shrink-0 grid-cols-2 gap-2 px-5 py-4">
+      <ul className="grid shrink-0 grid-cols-2 gap-2 px-4 py-4">
         {SIGN_VOCAB.map((item) => {
           const isSelected = item.key === selected.key;
           const isRecorded = referenceStatus?.[item.key] === "recorded";
@@ -70,17 +67,21 @@ export function SignRulebook({
               <button
                 type="button"
                 onClick={() => onSelect(item.key)}
-                className={`min-h-14 w-full border px-3 py-2 text-left transition-colors ${
+                className={`min-h-14 w-full rounded-[0.85rem] border px-3 py-2.5 text-left transition-all ${
                   isSelected
-                    ? "border-accent bg-accent/10"
-                    : "border-ink/10 bg-background hover:border-ink/30"
+                    ? "border-accent/40 bg-accent-soft shadow-sm"
+                    : "border-ink/10 bg-background/70 hover:border-accent/30 hover:bg-white"
                 }`}
               >
-                <span className="block text-sm font-medium text-ink">
+                <span className="block text-sm font-semibold text-ink">
                   {item.meaning}
                 </span>
-                <span className="mt-0.5 block text-xs text-muted">
-                  {isRecorded ? "Recorded" : "Default"}
+                <span
+                  className={`mt-0.5 block text-[0.7rem] ${
+                    isRecorded ? "text-success" : "text-muted"
+                  }`}
+                >
+                  {isRecorded ? "Your hand" : "Default"}
                 </span>
               </button>
             </li>
@@ -88,33 +89,31 @@ export function SignRulebook({
         })}
       </ul>
 
-      <div className="shrink-0 border-t border-ink/10 px-5 py-4">
-        <p className="text-xs font-medium uppercase tracking-wide text-muted">
-          How to do it
-        </p>
+      <div className="min-h-0 flex-1 overflow-y-auto border-t border-ink/8 px-5 py-4">
+        <p className="soft-label">How to do it</p>
         <p className="font-heading mt-2 text-2xl font-medium text-ink">
           {selected.meaning}
         </p>
         <p className="mt-1 text-sm text-muted">{selected.label}</p>
-        <ol className="mt-3 list-decimal space-y-2 pl-5 text-sm leading-relaxed text-ink">
+        <ol className="mt-4 list-decimal space-y-2.5 pl-5 text-sm leading-relaxed text-ink-soft">
           {selected.steps.map((step) => (
             <li key={step}>{step}</li>
           ))}
         </ol>
         <p
-          className={`mt-4 text-xs ${
+          className={`mt-4 text-xs leading-relaxed ${
             recorded ? "text-success" : "text-muted"
           }`}
         >
           {recorded
-            ? "Your recorded reference is in use for this sign."
-            : "Using the built-in default. Record your hand to match you."}
+            ? "Using your recorded hand for this sign."
+            : "Using the built-in default. Record your hand if it fits you better."}
         </p>
         <button
           type="button"
           onClick={() => onRecord(selected.key)}
           disabled={recordBusy}
-          className="mt-3 min-h-11 w-full bg-accent px-4 py-2.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
+          className="btn-primary mt-4 w-full"
         >
           Record this sign
         </button>
@@ -123,7 +122,7 @@ export function SignRulebook({
             type="button"
             onClick={() => onResetOne(selected.key)}
             disabled={recordBusy}
-            className="mt-2 min-h-11 w-full border border-ink/20 px-4 py-2.5 text-sm font-medium text-ink disabled:cursor-not-allowed disabled:opacity-40"
+            className="btn-secondary mt-2 w-full"
           >
             Use default for this sign
           </button>
@@ -132,7 +131,7 @@ export function SignRulebook({
           type="button"
           onClick={onResetAll}
           disabled={recordBusy}
-          className="mt-2 min-h-11 w-full border border-ink/20 px-4 py-2.5 text-sm font-medium text-ink disabled:cursor-not-allowed disabled:opacity-40"
+          className="btn-secondary mt-2 w-full"
         >
           Clear all recorded references
         </button>

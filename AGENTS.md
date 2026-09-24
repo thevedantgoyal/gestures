@@ -8,10 +8,10 @@ Do **not** commit `backend/.env`. It contains API keys and the database password
 
 A local app for people who use sign language as AAC:
 
-1. Webcam sees the hands (MediaPipe landmarks).
+1. Webcam sees the hands (MediaPipe landmarks; up to **two hands** — backend picks the best).
 2. The app recognizes a sign (Yes, Hello, Clear, …).
-3. Signs stack into a **sentence**.
-4. The sentence is **spoken** out loud.
+3. Signs stack into a **sentence** (Undo last word available; fist Clear still wipes all).
+4. The sentence is **polished** via Ollama when reachable, else the template builder, then **spoken**.
 
 There is also an older **aviation** practice mode (exit pointing, seatbelt). Sign language Talk is the active product.
 
@@ -27,7 +27,11 @@ If History returns 503, Postgres login failed. Talk / Train can still run only i
 
 - **Closed fist (all fingers + thumb in) = Clear** — wipes the sentence and starts over. Not Yes.
 - **Thumbs up = Yes.** Do not confuse with fist.
-- **Still open palm = Hello.** **Side-to-side wave = Goodbye.** Wave needs real motion (wag), not a still palm.
+- **Still open palm (thumb out) = Hello.** **Four fingers with thumb tucked = Undo** last word only.
+- **Side-to-side wave = Goodbye.** Wave needs real motion (wag), not a still palm.
+- **Undo last** removes only the last signed word (button or 4-finger sign); **Clear** (fist) wipes the whole sentence.
+- Speak / auto-speak calls `POST /ml/polish-sentence` (Ollama `llama3.1`) and falls back to `composeSignSentence` if the LLM is down.
+- Both hands may be visible; Talk scores the better in-frame hand (`select_primary_hand`), not only the largest.
 - **Signs panel is on the left** so the camera stays large.
 - User wants **real training**, not a fake progress UI. Add samples → Train now → Promote.
 - After promote, Talk should use the **trained model** for still signs. Wave/Goodbye stays on motion rules.
@@ -35,7 +39,9 @@ If History returns 503, Postgres login failed. Talk / Train can still run only i
 
 ## Dual path: rules now, model when promoted
 
-Until the user clicks **Promote**, Talk uses **hardcoded heuristics** in `backend/app/scoring/engine.py` (finger-extension rules + FastDTW for wave).
+Until the user clicks **Promote**, Talk uses **hardcoded heuristics** in `backend/app/scoring/engine.py` (finger-extension rules + FastDTW for wave), plus **temporal stabilization** in `backend/app/scoring/sign_stability.py` (vote window + hysteresis + top-2 score margin). No personal Train is required for that path.
+
+Train later still improves *your* hands further via the NumPy softmax model.
 
 | Step | What happens | Talk changes? |
 |---|---|---|
@@ -53,6 +59,7 @@ A Yes-only dataset cannot train (need 2 classes). A Yes-heavy dataset (e.g. 100 
 | `thumbs_down` | No |
 | `open_palm` | Hello |
 | `fist` | Clear |
+| `four` | Undo |
 | `pointing` | Help |
 | `peace_sign` | Thank you |
 | `please` | Please |
@@ -82,19 +89,20 @@ List/export samples: `GET /ml/samples?name=Yes`.
 ## Important files
 
 - `backend/main.py` — HTTP + websocket
-- `backend/app/scoring/engine.py` — heuristic classifier
+- `backend/app/services/sentence_polish.py` — Ollama grammar polish + template fallback
+- `backend/app/scoring/engine.py` — heuristic classifier + `select_primary_hand`
 - `backend/app/ml/dataset.py` — gold holds in/out of Postgres
 - `backend/app/ml/train.py` / `numpy_clf.py` — real training
 - `backend/app/ml/infer.py` — promote + live predict
 - `backend/app/models.py` — SQLAlchemy tables
 - `frontend/src/components/SignTrainer.tsx` — Train panel
-- `frontend/src/components/SignCommunicator.tsx` — sentence + speak
+- `frontend/src/components/SignCommunicator.tsx` — sentence + Speak / Undo / polish UI
 - `frontend/src/components/SignRulebook.tsx` — left Signs overlay
-- `frontend/src/lib/signSentence.ts` / `signVocab.ts` — sentence builder / vocab
+- `frontend/src/lib/signSentence.ts` / `signVocab.ts` — sentence builder / vocab / undo
 
 ## Stack (libraries vs hardcoded)
 
-- **Libraries:** MediaPipe Hand/Pose landmarker (browser), FastAPI, Next.js, SQLAlchemy/Postgres, FastDTW, Web Speech API, Gemini coaching (optional)
+- **Libraries:** MediaPipe Hand/Pose landmarker (browser, `numHands: 2`), FastAPI, Next.js, SQLAlchemy/Postgres, FastDTW, Web Speech API, Ollama (sentence polish), Gemini coaching (optional)
 - **Hardcoded until promote:** which finger shapes mean which sign (`engine.py`)
 - **Not used for the 12-sign vocab:** MediaPipe GestureRecognizer canned poses (too few labels)
 - Training is a **NumPy softmax** classifier because `sklearn` failed to load on this Windows machine (Application Control / DLL)

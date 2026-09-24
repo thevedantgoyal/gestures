@@ -83,10 +83,7 @@ function AttemptSkeleton() {
   return (
     <div className="flex flex-col gap-3" aria-hidden>
       {[0, 1, 2, 3].map((key) => (
-        <div
-          key={key}
-          className="animate-pulse border border-ink/10 bg-surface px-5 py-4"
-        >
+        <div key={key} className="panel animate-pulse px-5 py-4">
           <div className="flex justify-between gap-3">
             <div className="h-5 w-36 rounded bg-ink/10" />
             <div className="h-4 w-10 rounded bg-ink/10" />
@@ -167,10 +164,10 @@ export default function SessionDetailPage() {
 
   return (
     <main className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-8 px-6 pb-20 pt-10">
-      <div className="flex flex-wrap items-center justify-between gap-4">
+      <div className="fade-up flex flex-wrap items-center justify-between gap-4">
         <div>
           <p className="text-xs text-muted">
-            <Link href="/history" className="text-accent hover:underline">
+            <Link href="/history" className="font-semibold text-accent hover:underline">
               History
             </Link>
             <span className="mx-2 text-ink/30">/</span>
@@ -187,16 +184,13 @@ export default function SessionDetailPage() {
             </p>
           )}
         </div>
-        <Link
-          href="/"
-          className="shrink-0 text-sm text-accent underline-offset-2 hover:underline"
-        >
+        <Link href="/" className="nav-pill">
           Back to practice
         </Link>
       </div>
 
       {error && (
-        <div className="border border-alert/30 bg-alert/5 px-4 py-3 text-sm text-alert">
+        <div className="panel border-alert/25 bg-alert/5 px-4 py-3 text-sm text-alert">
           {error}
         </div>
       )}
@@ -204,13 +198,13 @@ export default function SessionDetailPage() {
       {loading && <AttemptSkeleton />}
 
       {!loading && detail && videoSrc && (
-        <section className="border border-ink/15 bg-surface p-4">
-          <p className="text-xs font-medium text-muted">Session replay</p>
+        <section className="panel fade-up p-4 sm:p-5">
+          <p className="soft-label">Session replay</p>
           <video
             ref={videoRef}
             src={videoSrc}
             controls
-            className="mt-3 aspect-video w-full bg-ink/90"
+            className="mt-3 aspect-video w-full overflow-hidden rounded-[0.9rem] bg-ink/90"
             onTimeUpdate={() => {
               const video = videoRef.current;
               if (!video) return;
@@ -220,12 +214,12 @@ export default function SessionDetailPage() {
           {activeEvent && (
             <div className="mt-3 flex flex-wrap items-center gap-3 text-sm">
               <span className="text-muted">{formatMs(activeEvent.t_ms)}</span>
-              <span className="font-medium text-ink">
+              <span className="font-semibold text-ink">
                 {gestureLabel(activeEvent.gesture)}
               </span>
               {activeEvent.correct !== null && (
                 <span
-                  className={`px-2 py-0.5 text-xs font-medium text-white ${
+                  className={`rounded-full px-2.5 py-0.5 text-xs font-semibold text-white ${
                     activeEvent.correct ? "bg-success" : "bg-alert"
                   }`}
                 >
@@ -238,12 +232,12 @@ export default function SessionDetailPage() {
             </div>
           )}
           {timeline.length > 0 && (
-            <ol className="mt-4 max-h-48 space-y-2 overflow-y-auto border-t border-ink/10 pt-3 text-xs">
+            <ol className="mt-4 max-h-48 space-y-2 overflow-y-auto border-t border-ink/8 pt-3 text-xs">
               {timeline.map((event, index) => (
                 <li key={`${event.t_ms}-${index}`}>
                   <button
                     type="button"
-                    className="flex w-full items-center justify-between gap-2 text-left text-muted hover:text-ink"
+                    className="flex w-full items-center justify-between gap-2 rounded-md px-1 py-1 text-left text-muted hover:bg-accent-soft/40 hover:text-ink"
                     onClick={() => {
                       const video = videoRef.current;
                       if (!video) return;
@@ -270,7 +264,7 @@ export default function SessionDetailPage() {
       )}
 
       {!loading && detail && (
-        <ol className="flex flex-col gap-3">
+        <ol className="fade-up flex flex-col gap-3">
           {detail.attempts.map((attempt) => {
             const percent = Math.round(
               Math.max(0, Math.min(1, attempt.score)) * 100,
@@ -278,10 +272,7 @@ export default function SessionDetailPage() {
             const isAviation = detail.mode === "aviation";
 
             return (
-              <li
-                key={attempt.id}
-                className="border border-ink/15 bg-surface px-5 py-4"
-              >
+              <li key={attempt.id} className="panel px-5 py-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <p className="font-heading text-lg font-medium text-ink">
@@ -291,7 +282,7 @@ export default function SessionDetailPage() {
                       {formatWhen(attempt.timestamp)}
                     </p>
                   </div>
-                  <span className="text-sm font-medium text-ink tabular-nums">
+                  <span className="text-sm font-semibold text-ink tabular-nums">
                     {percent}%
                   </span>
                 </div>
@@ -300,7 +291,7 @@ export default function SessionDetailPage() {
                   <div className="mt-3">
                     {attempt.correct !== null && (
                       <span
-                        className={`inline-block px-3 py-1 text-xs font-medium text-white ${
+                        className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold text-white ${
                           attempt.correct ? "bg-success" : "bg-alert"
                         }`}
                       >
@@ -308,10 +299,8 @@ export default function SessionDetailPage() {
                       </span>
                     )}
                     {attempt.coaching_text && (
-                      <div className="mt-3 border border-accent/30 bg-accent/5 px-3 py-2">
-                        <p className="text-xs font-medium text-accent">
-                          Coaching
-                        </p>
+                      <div className="mt-3 rounded-[0.85rem] border border-accent/25 bg-accent-soft/50 px-3 py-2">
+                        <p className="soft-label text-accent-deep">Coaching</p>
                         <p className="mt-1 text-sm leading-relaxed text-ink">
                           {attempt.coaching_text}
                         </p>
@@ -319,7 +308,7 @@ export default function SessionDetailPage() {
                     )}
                   </div>
                 ) : (
-                  <p className="mt-3 font-heading text-2xl font-medium text-ink">
+                  <p className="font-heading mt-3 text-2xl font-medium text-ink">
                     {attempt.meaning ?? "—"}
                   </p>
                 )}

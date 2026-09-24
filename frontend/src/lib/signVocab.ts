@@ -6,8 +6,8 @@ export const SIGN_VOCAB = [
     meaning: "Hello",
     steps: [
       "Face the camera with one hand in the frame.",
-      "Open all five fingers. Palm faces the camera.",
-      "Hold still. Do not wag or swipe.",
+      "Open all five fingers — thumb out. Palm faces the camera.",
+      "Hold still. Do not wag or swipe. Four fingers with thumb in is Undo, not Hello.",
     ],
   },
   {
@@ -41,6 +41,17 @@ export const SIGN_VOCAB = [
       "Close every finger, including the thumb.",
       "Do not raise the thumb.",
       "Hold still. This erases the sentence so you can start over.",
+    ],
+  },
+  {
+    key: "four",
+    label: "Four Fingers",
+    how: "Four fingers, thumb in",
+    meaning: "Undo",
+    steps: [
+      "Raise index, middle, ring, and pinky.",
+      "Tuck the thumb against the palm (not out like Hello).",
+      "Hold still. This removes only the last word.",
     ],
   },
   {
@@ -153,4 +164,8 @@ export function isSignGesture(value: string): value is SignGesture {
 
 export function isClearMeaning(value: string | null | undefined): boolean {
   return value === "Clear";
+}
+
+export function isUndoMeaning(value: string | null | undefined): boolean {
+  return value === "Undo";
 }

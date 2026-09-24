@@ -14,6 +14,7 @@ import { SignTrainer } from "../components/SignTrainer";
 import {
   appendSignToken,
   composeSignSentence,
+  undoLastSignToken,
   SENTENCE_SPEAK_IDLE_MS,
 } from "../lib/signSentence";
 import {
@@ -32,6 +33,7 @@ import {
 } from "../lib/handOverlay";
 import {
   isClearMeaning,
+  isUndoMeaning,
   isSignGesture,
   SIGN_GESTURES,
   SIGN_LABELS,
@@ -68,7 +70,7 @@ const API_BASE = "http://localhost:8000";
 const WS_URL = "ws://localhost:8000/ws/landmarks";
 const WS_SEND_INTERVAL_MS = 120;
 const WRIST_VISIBILITY_THRESHOLD = 0.3;
-const SPEAK_DWELL_MS = 400;
+const SPEAK_DWELL_MS = 550;
 const AVIATION_FEEDBACK_DEBOUNCE_MS = 500;
 const RECORD_CAPTURE_INTERVAL_MS = 100;
 const WS_MAX_RECONNECT_ATTEMPTS = 5;
@@ -83,6 +85,7 @@ const RECORD_DURATION_MS: Record<CalibrationGesture, number> = {
   thumbs_down: 2500,
   open_palm: 2500,
   fist: 2500,
+  four: 2500,
   pointing: 2500,
   peace_sign: 2500,
   please: 2500,
@@ -305,6 +308,41 @@ function pickLargestLandmarks(
     }
   });
   return { landmarks: groups[bestIndex], index: bestIndex };
+}
+
+function handGroupArea(landmarks: NormalizedLandmark[]): number {
+  let minX = 1;
+  let minY = 1;
+  let maxX = 0;
+  let maxY = 0;
+  for (const point of landmarks) {
+    minX = Math.min(minX, point.x);
+    minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x);
+    maxY = Math.max(maxY, point.y);
+  }
+  return Math.max(0, maxX - minX) * Math.max(0, maxY - minY);
+}
+
+/** Build payloads for every detected hand (up to MediaPipe numHands). */
+function extractAllHandLandmarks(
+  groups: NormalizedLandmark[][],
+  handednesses?: Array<Array<{ categoryName?: string }>>,
+): { hands: HandStreamLandmarks[]; primaryIndex: number } {
+  const hands = groups.map((group, index) => {
+    const label = handednesses?.[index]?.[0]?.categoryName;
+    return extractHandLandmarks(group, label);
+  });
+  let primaryIndex = 0;
+  let bestArea = -1;
+  groups.forEach((group, index) => {
+    const area = handGroupArea(group);
+    if (area > bestArea) {
+      bestArea = area;
+      primaryIndex = index;
+    }
+  });
+  return { hands, primaryIndex };
 }
 
 function cameraPermissionMessage(err: unknown): string {
@@ -532,7 +570,7 @@ function unlockSpeechSynthesis(
 }
 
 export default function Home() {
-  const [mode, setMode] = useState<Mode>("aviation");
+  const [mode, setMode] = useState<Mode>("sign_language");
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [poseReady, setPoseReady] = useState(false);
@@ -553,6 +591,7 @@ export default function Home() {
   const [coachingText, setCoachingText] = useState<string | null>(null);
   const [coachingLoading, setCoachingLoading] = useState(false);
   const [speaking, setSpeaking] = useState(false);
+  const [polishing, setPolishing] = useState(false);
   const [voiceUnlocked, setVoiceUnlocked] = useState(false);
   const [motionProgress, setMotionProgress] = useState<number | null>(null);
   const [motionHint, setMotionHint] = useState<string | null>(null);
@@ -613,6 +652,7 @@ export default function Home() {
   const voiceUnlockedRef = useRef(false);
   voiceUnlockedRef.current = voiceUnlocked;
   const handLandmarkStructureLoggedRef = useRef(false);
+  const hadHandsRef = useRef(false);
   const indexTrailRef = useRef<TrailPoint[]>([]);
   const fingertipTrailRef = useRef<TrailPoint[]>([]);
   const handStyleRef = useRef<HandDrawStyle | null>(null);
@@ -644,7 +684,17 @@ export default function Home() {
     setSentenceTokens([]);
     setLastSpokenSentence(null);
     setSpeaking(false);
+    setPolishing(false);
     stopAllSpeech();
+  }
+
+  function undoLastWord() {
+    if (speaking || polishing) return;
+    const next = undoLastSignToken(sentenceTokensRef.current);
+    sentenceTokensRef.current = next;
+    lastCommittedSignRef.current = null;
+    releasedAfterCommitRef.current = true;
+    setSentenceTokens(next);
   }
 
   function speakComposedSentence(text: string) {
@@ -661,15 +711,45 @@ export default function Home() {
     setSentenceTokens([]);
   }
 
+  async function speakWithGrammarPolish(tokens: string[]) {
+    const fallback = composeSignSentence(tokens);
+    if (!fallback.trim()) return;
+    if (polishing || speaking) return;
+    setPolishing(true);
+    let spoken = fallback;
+    try {
+      const response = await fetch(`${API_BASE}/ml/polish-sentence`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tokens, fallback }),
+      });
+      if (response.ok) {
+        const data = (await response.json()) as {
+          sentence?: string;
+          source?: string;
+        };
+        if (typeof data.sentence === "string" && data.sentence.trim()) {
+          spoken = data.sentence.trim();
+        }
+        console.log("[polish]", data.source ?? "unknown", spoken);
+      }
+    } catch (err) {
+      console.warn("[polish] failed, using template", err);
+    } finally {
+      setPolishing(false);
+    }
+    speakComposedSentence(spoken);
+  }
+
   useEffect(() => {
     if (mode !== "sign_language" || !isStreaming || !voiceUnlocked) return;
     if (sentenceTokens.length === 0) return;
-    if (speaking) return;
+    if (speaking || polishing) return;
     // Keep collecting signs while the current one is still locked.
     if (gestureFeedback?.correct) return;
-    const text = composeSignSentence(sentenceTokens);
+    const tokens = [...sentenceTokensRef.current];
     const timer = window.setTimeout(() => {
-      speakComposedSentence(text);
+      void speakWithGrammarPolish(tokens);
     }, SENTENCE_SPEAK_IDLE_MS);
     return () => window.clearTimeout(timer);
   }, [
@@ -678,6 +758,7 @@ export default function Home() {
     isStreaming,
     voiceUnlocked,
     speaking,
+    polishing,
     gestureFeedback?.correct,
   ]);
 
@@ -964,6 +1045,17 @@ export default function Home() {
                       score,
                       meaning: "Clear",
                     });
+                  } else if (gesture === "four" || isUndoMeaning(data.meaning)) {
+                    const next = undoLastSignToken(sentenceTokensRef.current);
+                    sentenceTokensRef.current = next;
+                    setSentenceTokens(next);
+                    lastCommittedSignRef.current = "four";
+                    setGestureFeedback({
+                      gesture: "four",
+                      correct: true,
+                      score,
+                      meaning: "Undo",
+                    });
                   } else {
                     const next = appendSignToken(
                       sentenceTokensRef.current,
@@ -1206,6 +1298,7 @@ export default function Home() {
 
         const now = performance.now();
         let streamLandmarks: StreamLandmarks | null = null;
+        let handsPayload: HandStreamLandmarks[] | null = null;
         let notVisible = false;
 
         if (activeMode === "sign_language") {
@@ -1216,11 +1309,18 @@ export default function Home() {
                 video,
                 performance.now(),
               );
-              const picked = pickLargestLandmarks(result.landmarks);
-              if (picked) {
+              if (result.landmarks.length > 0) {
+                hadHandsRef.current = true;
+                const { hands, primaryIndex } = extractAllHandLandmarks(
+                  result.landmarks,
+                  result.handednesses as
+                    | Array<Array<{ categoryName?: string }>>
+                    | undefined,
+                );
+                const primaryLandmarks = result.landmarks[primaryIndex];
                 if (!handLandmarkStructureLoggedRef.current) {
                   handLandmarkStructureLoggedRef.current = true;
-                  const sample = picked.landmarks[0] as NormalizedLandmark & {
+                  const sample = primaryLandmarks[0] as NormalizedLandmark & {
                     visibility?: number;
                   };
                   console.log(
@@ -1228,6 +1328,8 @@ export default function Home() {
                     sample ? Object.keys(sample) : null,
                     "visibility=",
                     sample?.visibility,
+                    "hands=",
+                    hands.length,
                     "full sample=",
                     sample,
                   );
@@ -1235,14 +1337,14 @@ export default function Home() {
                 const nowMs = performance.now();
                 indexTrailRef.current = pushIndexTrail(
                   indexTrailRef.current,
-                  picked.landmarks,
+                  primaryLandmarks,
                   nowMs,
                 );
                 const moving = isTrailMoving(indexTrailRef.current);
                 if (moving) {
                   fingertipTrailRef.current = pushFingertipTrail(
                     fingertipTrailRef.current,
-                    picked.landmarks,
+                    primaryLandmarks,
                     nowMs,
                   );
                 } else {
@@ -1257,19 +1359,14 @@ export default function Home() {
                 }
                 drawHandOverlay(
                   ctx,
-                  [picked.landmarks],
+                  result.landmarks,
                   fingertipTrailRef.current,
                   canvas.width,
                   canvas.height,
                   style,
                 );
-                const handedness =
-                  result.handednesses?.[picked.index]?.[0]?.categoryName ??
-                  undefined;
-                streamLandmarks = extractHandLandmarks(
-                  picked.landmarks,
-                  handedness,
-                );
+                streamLandmarks = hands[primaryIndex];
+                handsPayload = hands;
                 const framing = assessHandFramingClient(
                   streamLandmarks as HandStreamLandmarks,
                 );
@@ -1278,6 +1375,8 @@ export default function Home() {
                   console.log(
                     "[hand_framing]",
                     framing.reason,
+                    "hands=",
+                    hands.length,
                     "in_frame=",
                     framing.pointsInFrame,
                     "bbox_area=",
@@ -1287,6 +1386,17 @@ export default function Home() {
                   );
                 }
               } else {
+                if (hadHandsRef.current) {
+                  hadHandsRef.current = false;
+                  releasedAfterCommitRef.current = true;
+                  // Drop the locked sign so idle auto-speak can start after hands leave.
+                  setGestureFeedback({
+                    gesture: "none",
+                    correct: false,
+                    score: 0,
+                    meaning: null,
+                  });
+                }
                 indexTrailRef.current = [];
                 fingertipTrailRef.current = [];
                 if (handStyleRef.current !== null) {
@@ -1352,14 +1462,16 @@ export default function Home() {
               const timestamp = Date.now();
               try {
                 pendingSendAtRef.current.set(timestamp, performance.now());
-                ws.send(
-                  JSON.stringify({
-                    mode: activeMode,
-                    session_id: sessionIdRef.current || undefined,
-                    landmarks: streamLandmarks,
-                    timestamp,
-                  }),
-                );
+                const payload: Record<string, unknown> = {
+                  mode: activeMode,
+                  session_id: sessionIdRef.current || undefined,
+                  landmarks: streamLandmarks,
+                  timestamp,
+                };
+                if (handsPayload && handsPayload.length > 0) {
+                  payload.hands = handsPayload;
+                }
+                ws.send(JSON.stringify(payload));
                 if (pendingSendAtRef.current.size > 50) {
                   const oldest = pendingSendAtRef.current.keys().next().value;
                   if (oldest !== undefined) {
@@ -1911,10 +2023,11 @@ export default function Home() {
 
   if (isStreaming) {
     return (
-      <div className="flex min-h-full flex-1 flex-col bg-background">
-        <header className="flex flex-wrap items-center gap-3 border-b border-ink/10 bg-surface px-4 py-3 sm:gap-4 sm:px-6">
+      <div className="flex min-h-full flex-1 flex-col">
+        <header className="flex flex-wrap items-center gap-2.5 border-b border-ink/8 bg-surface/80 px-4 py-3 backdrop-blur-md sm:gap-3 sm:px-6">
           <div className="min-w-0 flex-1 basis-[12rem]">
-            <h1 className="font-heading truncate text-base font-medium text-ink sm:text-lg">
+            <p className="soft-label !normal-case !tracking-normal">Gesture</p>
+            <h1 className="font-heading truncate text-lg font-medium text-ink sm:text-xl">
               {modeLabel}
               <span className="text-muted"> — {sessionSubtitle}</span>
             </h1>
@@ -1922,90 +2035,66 @@ export default function Home() {
           <button
             type="button"
             onClick={() => setRulebookOpen((open) => !open)}
-            className={`shrink-0 border px-3 py-1.5 text-xs transition-colors ${
-              rulebookOpen
-                ? "border-accent bg-accent text-white"
-                : "border-ink/20 text-muted hover:border-ink/40 hover:text-ink"
-            }`}
+            className={`nav-pill shrink-0 ${rulebookOpen ? "nav-pill-active" : ""}`}
           >
             Signs
           </button>
           <button
             type="button"
             onClick={() => setCalibrationOpen((open) => !open)}
-            className={`shrink-0 border px-3 py-1.5 text-xs transition-colors ${
-              calibrationOpen
-                ? "border-accent bg-accent text-white"
-                : "border-ink/20 text-muted hover:border-ink/40 hover:text-ink"
-            }`}
+            className={`nav-pill shrink-0 ${calibrationOpen ? "nav-pill-active" : ""}`}
           >
-            Record reference
+            Record
           </button>
           {mode === "sign_language" && (
             <button
               type="button"
               onClick={() => setTrainOpen((open) => !open)}
-              className={`shrink-0 border px-3 py-1.5 text-xs transition-colors ${
-                trainOpen
-                  ? "border-accent bg-accent text-white"
-                  : "border-ink/20 text-muted hover:border-ink/40 hover:text-ink"
-              }`}
+              className={`nav-pill shrink-0 ${trainOpen ? "nav-pill-active" : ""}`}
             >
-              Train model
+              Train
             </button>
           )}
           <button
             type="button"
             onClick={stopWebcam}
-            className="shrink-0 text-sm text-accent underline-offset-2 hover:underline"
+            className="nav-pill shrink-0"
           >
             Change mode
           </button>
-          <Link
-            href="/history"
-            className="shrink-0 text-sm text-accent underline-offset-2 hover:underline"
-          >
+          <Link href="/history" className="nav-pill shrink-0">
             History
           </Link>
           <div
-            className={`flex shrink-0 items-center gap-2 border px-3 py-1.5 text-xs ${
+            className={`flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold ${
               wsStatus === "connected"
-                ? "border-success/30 bg-success/10 text-success"
+                ? "border-success/25 bg-success/10 text-success"
                 : wsStatus === "connecting" || wsStatus === "reconnecting"
-                  ? "border-accent/30 bg-accent/10 text-accent"
-                  : "border-alert/30 bg-alert/10 text-alert"
+                  ? "border-accent/25 bg-accent/10 text-accent"
+                  : "border-alert/25 bg-alert/10 text-alert"
             }`}
           >
             <span
-              className={`h-1.5 w-1.5 rounded-full ${
+              className={`status-dot ${
                 wsStatus === "connected"
                   ? "bg-success"
                   : wsStatus === "connecting" || wsStatus === "reconnecting"
-                    ? "bg-accent"
+                    ? "bg-accent pulse-soft"
                     : "bg-alert"
               }`}
               aria-hidden
             />
             {wsStatus === "connected"
-              ? "Connected — streaming"
+              ? "Live"
               : wsStatus === "connecting"
                 ? "Connecting…"
                 : wsStatus === "reconnecting"
-                  ? "Disconnected — reconnecting…"
-                  : "Disconnected"}
+                  ? "Reconnecting…"
+                  : "Offline"}
           </div>
         </header>
 
         <div className="relative flex flex-1 flex-col gap-4 p-4 lg:flex-row lg:items-start lg:gap-6 lg:p-6">
-          {mode === "sign_language" && !rulebookOpen && (
-            <button
-              type="button"
-              onClick={() => setRulebookOpen(true)}
-              className="absolute left-0 top-28 z-20 border border-l-0 border-ink/20 bg-surface px-2 py-8 text-xs font-medium tracking-wide text-ink shadow-sm hover:bg-accent hover:text-white lg:top-24"
-            >
-              Signs
-            </button>
-          )}
           {mode === "sign_language" && (
             <SignRulebook
               open={rulebookOpen}
@@ -2042,7 +2131,7 @@ export default function Home() {
                 className="pointer-events-none absolute inset-0 h-full w-full object-contain"
               />
               {limbsNotVisible && (
-                <div className="pointer-events-none absolute left-1/2 top-4 z-10 -translate-x-1/2 border border-alert/40 bg-alert px-3 py-1.5 text-xs font-medium text-white shadow-sm">
+                <div className="pointer-events-none absolute left-1/2 top-4 z-10 -translate-x-1/2 rounded-full bg-alert px-4 py-2 text-xs font-semibold text-white shadow-lg">
                   {mode === "sign_language"
                     ? "Move closer — hand not fully visible"
                     : "Move back — arms not fully visible"}
@@ -2050,11 +2139,11 @@ export default function Home() {
               )}
 
               {calibrationPhase === "countdown" && (
-                <div className="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center bg-ink/45">
+                <div className="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center bg-ink/50 backdrop-blur-[2px]">
                   <span className="font-heading text-8xl font-medium text-white tabular-nums">
                     {countdown}
                   </span>
-                  <span className="mt-2 text-sm text-white/80">
+                  <span className="mt-3 text-sm text-white/85">
                     Get into position —{" "}
                     {calibrationGesture
                       ? GESTURE_LABELS[calibrationGesture]
@@ -2064,9 +2153,12 @@ export default function Home() {
               )}
 
               {calibrationPhase === "recording" && (
-                <div className="pointer-events-none absolute inset-x-0 top-4 z-20 mx-auto w-64">
-                  <div className="flex items-center justify-center gap-2 bg-alert px-3 py-1.5 text-xs font-medium text-white">
-                    <span className="h-2 w-2 rounded-full bg-white" aria-hidden />
+                <div className="pointer-events-none absolute inset-x-0 top-4 z-20 mx-auto w-64 overflow-hidden rounded-full">
+                  <div className="flex items-center justify-center gap-2 bg-alert px-3 py-1.5 text-xs font-semibold text-white">
+                    <span
+                      className="status-dot bg-white pulse-soft"
+                      aria-hidden
+                    />
                     Recording…
                   </div>
                   <div className="h-1.5 w-full bg-white/30">
@@ -2108,16 +2200,16 @@ export default function Home() {
               />
             )}
             {calibrationOpen && (
-              <div className="border-2 border-accent/50 bg-surface p-5">
+              <div className="panel fade-up border-accent/30 p-5">
                 <div className="flex items-start justify-between gap-3">
                   <div>
-                    <h2 className="font-heading text-lg font-medium text-ink">
-                      Calibrate reference
+                    <h2 className="font-heading text-xl font-medium text-ink">
+                      Record reference
                     </h2>
                     <p className="mt-1 text-xs leading-relaxed text-muted">
                       {mode === "sign_language"
-                        ? "Record each sign with one hand clearly in frame."
-                        : "Record each gesture yourself to replace the built-in defaults."}
+                        ? "Save your hand once so recognition matches you better."
+                        : "Replace the built-in defaults with your own gestures."}
                     </p>
                   </div>
                   <button
@@ -2126,13 +2218,13 @@ export default function Home() {
                       cancelCalibration();
                       setCalibrationOpen(false);
                     }}
-                    className="shrink-0 text-xs text-muted hover:text-ink"
+                    className="nav-pill shrink-0 !px-3 !py-1.5"
                   >
                     Close
                   </button>
                 </div>
 
-                <dl className="mt-4 max-h-48 space-y-1.5 overflow-y-auto border-t border-ink/10 pt-4 text-xs">
+                <dl className="mt-4 max-h-48 space-y-2 overflow-y-auto border-t border-ink/8 pt-4 text-xs">
                   {calibrationGestures.map((gesture) => (
                     <div
                       key={gesture}
@@ -2141,7 +2233,7 @@ export default function Home() {
                       <dt className="text-muted">
                         {GESTURE_LABELS[gesture]}
                         {mode === "sign_language" && (
-                          <span className="text-ink/40">
+                          <span className="text-ink/35">
                             {" "}
                             · {SIGN_MEANINGS[gesture as SignGesture]}
                           </span>
@@ -2150,14 +2242,14 @@ export default function Home() {
                       <dd
                         className={
                           referenceStatus?.[gesture] === "recorded"
-                            ? "shrink-0 text-success"
+                            ? "shrink-0 font-semibold text-success"
                             : "shrink-0 text-muted"
                         }
                       >
                         {referenceStatus
                           ? referenceStatus[gesture] === "recorded"
                             ? "Recorded"
-                            : "Using default"
+                            : "Default"
                           : "…"}
                       </dd>
                     </div>
@@ -2171,7 +2263,7 @@ export default function Home() {
                       type="button"
                       onClick={() => runCalibration(gesture)}
                       disabled={calibrationBusy}
-                      className="border border-ink/20 px-3 py-2 text-left text-sm text-ink transition-colors hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
+                      className="btn-secondary w-full !min-h-11 justify-between px-3 py-2 text-left text-sm"
                     >
                       Record {GESTURE_LABELS[gesture]}
                       <span className="ml-1 text-xs text-muted">
@@ -2185,7 +2277,7 @@ export default function Home() {
                   type="button"
                   onClick={() => void resetAllRecordedReferences()}
                   disabled={calibrationBusy}
-                  className="mt-3 min-h-11 w-full border border-ink/20 px-3 py-2 text-sm text-ink disabled:cursor-not-allowed disabled:opacity-50"
+                  className="btn-secondary mt-3 w-full"
                 >
                   Clear all recorded references
                 </button>
@@ -2193,14 +2285,14 @@ export default function Home() {
                 {calibrationPhase === "recording" && (
                   <div className="mt-4">
                     <div className="mb-1.5 flex items-center justify-between text-xs">
-                      <span className="text-alert">Recording…</span>
+                      <span className="font-semibold text-alert">Recording…</span>
                       <span className="text-muted tabular-nums">
                         {Math.round(recordProgress * 100)}%
                       </span>
                     </div>
-                    <div className="h-1.5 w-full bg-ink/10">
+                    <div className="progress-track">
                       <div
-                        className="h-full bg-alert"
+                        className="progress-fill bg-alert"
                         style={{
                           width: `${Math.round(recordProgress * 100)}%`,
                         }}
@@ -2232,6 +2324,7 @@ export default function Home() {
               <SignCommunicator
                 voiceUnlocked={voiceUnlocked}
                 speaking={speaking}
+                polishing={polishing}
                 tokens={sentenceTokens}
                 sentence={composedSentence}
                 lastSpoken={lastSpokenSentence}
@@ -2260,7 +2353,10 @@ export default function Home() {
                     onEnd: () => setSpeaking(false),
                   });
                 }}
-                onSpeak={() => speakComposedSentence(composedSentence)}
+                onSpeak={() => {
+                  void speakWithGrammarPolish([...sentenceTokensRef.current]);
+                }}
+                onUndo={undoLastWord}
                 onRepeat={() => {
                   if (!lastSpokenSentence) return;
                   speakSentence(lastSpokenSentence, {
@@ -2271,8 +2367,8 @@ export default function Home() {
                 onClear={resetSentenceBuilder}
               />
             ) : (
-            <div className="border border-ink/15 bg-surface p-5">
-              <p className="text-xs text-muted">Current result</p>
+            <div className="panel fade-up p-5 sm:p-6">
+              <p className="soft-label">Current result</p>
               {!gestureFeedback ? (
                 <p className="mt-3 text-sm leading-relaxed text-muted">
                   Move into Exit Pointing or Seatbelt Demo. Feedback appears
@@ -2280,10 +2376,10 @@ export default function Home() {
                 </p>
               ) : gestureFeedback.gesture === "none" ? (
                 <div className="mt-3">
-                  <h2 className="font-heading text-2xl font-medium text-muted">
+                  <h2 className="font-heading text-2xl font-medium text-ink-soft">
                     Ready when you move
                   </h2>
-                  <p className="mt-2 text-sm text-muted">
+                  <p className="mt-2 text-sm leading-relaxed text-muted">
                     Raise both arms for Exit Pointing, or slide both hands
                     together at your waist for Seatbelt Demo.
                   </p>
@@ -2298,7 +2394,7 @@ export default function Home() {
                     }
                   </h2>
                   <div
-                    className={`mt-4 inline-block px-4 py-2 text-sm font-medium text-white ${
+                    className={`mt-4 inline-flex rounded-full px-4 py-2 text-sm font-semibold text-white ${
                       gestureFeedback.correct ? "bg-success" : "bg-alert"
                     }`}
                   >
@@ -2306,7 +2402,7 @@ export default function Home() {
                       ? "Correct — keep going"
                       : "You're doing it wrong"}
                   </div>
-                  <p className="mt-3 text-sm text-muted">
+                  <p className="mt-3 text-sm leading-relaxed text-muted">
                     {gestureFeedback.correct
                       ? gestureFeedback.gesture === "seatbelt_demo"
                         ? "Finish the waist slide smoothly."
@@ -2318,13 +2414,13 @@ export default function Home() {
                   <div className="mt-5">
                     <div className="mb-2 flex items-center justify-between text-sm">
                       <span className="text-muted">Confidence</span>
-                      <span className="font-medium text-ink">
+                      <span className="font-semibold text-ink">
                         {scorePercent}%
                       </span>
                     </div>
-                    <div className="h-2 w-full bg-ink/10">
+                    <div className="progress-track">
                       <div
-                        className={`h-full transition-[width] duration-300 ${
+                        className={`progress-fill ${
                           gestureFeedback.correct ? "bg-success" : "bg-alert"
                         }`}
                         style={{ width: `${scorePercent}%` }}
@@ -2366,10 +2462,8 @@ export default function Home() {
 
                   {!gestureFeedback.correct &&
                     (coachingLoading || coachingText) && (
-                      <div className="mt-5 border border-accent/30 bg-accent/5 px-4 py-3">
-                        <p className="text-xs font-medium text-accent">
-                          Coaching
-                        </p>
+                      <div className="mt-5 rounded-[0.9rem] border border-accent/25 bg-accent-soft/50 px-4 py-3">
+                        <p className="soft-label text-accent-deep">Coaching</p>
                         {coachingLoading && !coachingText ? (
                           <p className="mt-1.5 text-sm text-muted">
                             Getting feedback…
@@ -2437,68 +2531,69 @@ export default function Home() {
   }
 
   return (
-    <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col items-center gap-14 px-6 pb-20 pt-24">
-      <div className="flex w-full justify-end">
-        <Link
-          href="/history"
-          className="text-sm text-accent underline-offset-2 hover:underline"
-        >
+    <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col items-center gap-12 px-6 pb-20 pt-16 sm:pt-20">
+      <div className="fade-up flex w-full items-center justify-between gap-4">
+        <p className="font-heading text-2xl font-medium text-ink sm:text-3xl">
+          Gesture
+        </p>
+        <Link href="/history" className="nav-pill">
           History
         </Link>
       </div>
-      <h1 className="font-heading text-center text-4xl font-medium tracking-tight text-ink sm:text-[2.75rem]">
-        AI Gesture Recognition Platform
-      </h1>
 
-      <section className="flex w-full flex-col gap-5">
-        <p className="text-center text-sm text-muted">
-          Choose how you want to practice
+      <section className="fade-up flex w-full max-w-2xl flex-col items-center text-center">
+        <h1 className="font-heading text-4xl font-medium leading-tight tracking-tight text-ink sm:text-5xl">
+          Talk with your hands
+        </h1>
+        <p className="mt-4 max-w-xl text-base leading-relaxed text-muted sm:text-lg">
+          Show signs to build a sentence, then hear it spoken out loud — calm
+          and clear for everyday communication.
         </p>
+      </section>
+
+      <section className="fade-up flex w-full flex-col gap-4">
+        <p className="soft-label text-center">Choose a mode</p>
         <div className="grid w-full gap-4 sm:grid-cols-2">
           <button
             type="button"
-            onClick={() => setMode("aviation")}
-            className={`border-2 bg-surface px-6 py-7 text-left transition-colors ${
-              mode === "aviation"
-                ? "border-accent"
-                : "border-ink/15 hover:border-ink/30"
+            onClick={() => setMode("sign_language")}
+            className={`mode-card ${
+              mode === "sign_language" ? "mode-card-active" : ""
             }`}
           >
-            <span className="font-heading block text-lg font-medium text-ink">
+            <span className="soft-label text-accent-deep">Recommended</span>
+            <span className="font-heading mt-2 block text-2xl font-medium text-ink">
+              Sign Language
+            </span>
+            <span className="mt-2 block text-sm leading-relaxed text-muted">
+              Show signs one after another. They become a sentence, then the
+              computer speaks it.
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("aviation")}
+            className={`mode-card ${mode === "aviation" ? "mode-card-active" : ""}`}
+          >
+            <span className="soft-label">Practice</span>
+            <span className="font-heading mt-2 block text-2xl font-medium text-ink">
               Aviation Training
             </span>
             <span className="mt-2 block text-sm leading-relaxed text-muted">
               Practice standard hand signals used on the flight deck and ramp.
             </span>
           </button>
-          <button
-            type="button"
-            onClick={() => setMode("sign_language")}
-            className={`border-2 bg-surface px-6 py-7 text-left transition-colors ${
-              mode === "sign_language"
-                ? "border-accent"
-                : "border-ink/15 hover:border-ink/30"
-            }`}
-          >
-            <span className="font-heading block text-lg font-medium text-ink">
-              Sign Language
-            </span>
-            <span className="mt-2 block text-sm leading-relaxed text-muted">
-              Show signs one after another. They become a sentence, then the
-              computer speaks it out loud.
-            </span>
-          </button>
         </div>
         <p className="text-center text-sm text-muted">
-          Active mode: {modeLabel}
+          Selected: <span className="font-semibold text-ink">{modeLabel}</span>
         </p>
       </section>
 
-      <section className="flex w-full flex-col items-center gap-6">
+      <section className="fade-up flex w-full flex-col items-center gap-5">
         <button
           type="button"
           onClick={startWebcam}
-          className="bg-accent px-6 py-3 text-sm font-medium text-white transition-colors hover:brightness-95"
+          className="btn-primary min-w-[12rem] px-8 text-base"
         >
           Enable Webcam
         </button>
@@ -2508,7 +2603,7 @@ export default function Home() {
         )}
         {modelError && <p className="text-sm text-alert">{modelError}</p>}
         {cameraError && (
-          <div className="max-w-md border border-alert/30 bg-alert/5 px-4 py-3 text-center text-sm text-alert">
+          <div className="panel max-w-md border-alert/25 bg-alert/5 px-4 py-3 text-center text-sm text-alert">
             {cameraError}
           </div>
         )}

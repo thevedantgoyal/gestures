@@ -25,6 +25,7 @@ SIGN_POSE_GESTURES = (
     "thumbs_down",
     "open_palm",
     "fist",
+    "four",
     "pointing",
     "peace_sign",
     "please",
@@ -40,6 +41,7 @@ SignClass = Literal[
     "thumbs_down",
     "open_palm",
     "fist",
+    "four",
     "pointing",
     "peace_sign",
     "please",
@@ -101,11 +103,11 @@ AVIATION_HOLD_FRAMES = 4
 FINGER_EXTENDED_MCP_RATIO = 1.28
 # Goodbye is a wag: left-right-left (or right-left-right), not a held palm.
 WAVE_MIN_SAMPLES = 5
-WAVE_MIN_AMPLITUDE = 0.08
-WAVE_REVERSAL_DELTA = 0.022
+WAVE_MIN_AMPLITUDE = 0.085
+WAVE_REVERSAL_DELTA = 0.02
 WAVE_MIN_REVERSALS = 2
-# Mean wrist travel between frames — used for overlay / progress only.
-HAND_MOTION_ACTIVE_THRESHOLD = 0.016
+# Mean wrist travel between frames — Hello must stay still; overlay uses this too.
+HAND_MOTION_ACTIVE_THRESHOLD = 0.014
 
 HAND_TIP_KEYS = (
     "thumb_tip",
@@ -286,6 +288,56 @@ def has_low_hand_visibility(landmarks: dict[str, Any]) -> bool:
     return not bool(assess_hand_framing(landmarks).get("ok"))
 
 
+def hand_bbox_area(landmarks: dict[str, Any]) -> float:
+    """Normalized bounding-box area of a hand payload (0 if incomplete)."""
+    framing = assess_hand_framing(landmarks)
+    return float(framing.get("bbox_area") or 0.0)
+
+
+def select_primary_hand(
+    hands: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Choose which hand to score when MediaPipe returns left and right.
+
+    Preference among in-frame hands: highest still-sign confidence, then
+    larger bbox. Out-of-frame hands are ignored unless none are framed.
+    """
+    candidates: list[dict[str, Any]] = [
+        hand for hand in hands if isinstance(hand, dict) and is_hand_landmarks(hand)
+    ]
+    if not candidates:
+        return None, {"hand_count": 0, "reason": "no_hand_landmarks"}
+
+    framed: list[tuple[dict[str, Any], dict[str, Any], float, float]] = []
+    for hand in candidates:
+        framing = assess_hand_framing(hand)
+        area = float(framing.get("bbox_area") or 0.0)
+        if framing.get("ok"):
+            _gesture, score, _scores, _detail = best_sign_pose(hand)
+            framed.append((hand, framing, float(score), area))
+
+    pool = framed
+    if not pool:
+        # Fall back to largest visible hand even if framing failed.
+        pool = []
+        for hand in candidates:
+            framing = assess_hand_framing(hand)
+            area = float(framing.get("bbox_area") or 0.0)
+            pool.append((hand, framing, 0.0, area))
+
+    chosen_hand, chosen_framing, chosen_score, chosen_area = max(
+        pool, key=lambda row: (row[2], row[3])
+    )
+    handedness = chosen_hand.get("handedness")
+    return chosen_hand, {
+        "hand_count": len(candidates),
+        "selected_handedness": handedness if isinstance(handedness, str) else None,
+        "selected_score": round(chosen_score, 4),
+        "selected_bbox_area": round(chosen_area, 4),
+        "framing_ok": bool(chosen_framing.get("ok")),
+        "reason": "best_score" if framed else "largest_fallback",
+    }
+
 def _finger_extended(landmarks: dict[str, Any], tip_key: str, pip_key: str, mcp_key: str) -> bool:
     """True when a finger is clearly outstretched from the palm."""
     return _finger_extension_ratio(landmarks, tip_key, mcp_key) > FINGER_EXTENDED_MCP_RATIO
@@ -342,6 +394,26 @@ def _mean_finger_extension(landmarks: dict[str, Any]) -> float:
     return float(sum(ratios) / 4.0)
 
 
+def _thumb_tip_above_fingers(landmarks: dict[str, Any], margin: float = 0.04) -> bool:
+    """Thumb tip sits clearly above the other finger tips (Yes cue)."""
+    tip = _point(landmarks, "thumb_tip")
+    if not tip:
+        return False
+    others_y: list[float] = []
+    for key in ("index_tip", "middle_tip", "ring_tip", "pinky_tip"):
+        other = _point(landmarks, key)
+        if other:
+            others_y.append(float(other["y"]))
+    if len(others_y) < 3:
+        return False
+    return float(tip["y"]) < min(others_y) - margin
+
+
+def _fingers_clearly_curled(landmarks: dict[str, Any]) -> bool:
+    """Four fingers tucked — used for Yes/No/Clear separation."""
+    return _mean_finger_extension(landmarks) <= 1.18
+
+
 def looks_like_thumbs_up(landmarks: dict[str, Any]) -> bool:
     """Thumb sticks clearly above a closed fist — not a tucked thumb on a fist."""
     if not is_hand_landmarks(landmarks):
@@ -350,15 +422,18 @@ def looks_like_thumbs_up(landmarks: dict[str, Any]) -> bool:
     mcp = _point(landmarks, "thumb_mcp")
     if not tip or not mcp:
         return False
-    if tip["y"] >= mcp["y"] - 0.05:
+    # Strong vertical cue: tip well above MCP.
+    if tip["y"] >= mcp["y"] - 0.055:
         return False
     thumb_r = _finger_extension_ratio(landmarks, "thumb_tip", "thumb_mcp")
     others = _mean_finger_extension(landmarks)
-    if thumb_r < 1.22:
+    if thumb_r < 1.25:
         return False
-    if others > 1.22:
+    if others > 1.18:
         return False
-    return thumb_r >= others + 0.14
+    if not _thumb_tip_above_fingers(landmarks, margin=0.03):
+        return False
+    return thumb_r >= others + 0.18
 
 
 def looks_like_fist(landmarks: dict[str, Any]) -> bool:
@@ -369,8 +444,38 @@ def looks_like_fist(landmarks: dict[str, Any]) -> bool:
         return False
     if _thumb_extended_down(landmarks):
         return False
-    others = _mean_finger_extension(landmarks)
-    return others <= 1.22
+    if not _fingers_clearly_curled(landmarks):
+        return False
+    tip = _point(landmarks, "thumb_tip")
+    mcp = _point(landmarks, "thumb_mcp")
+    # Reject Yes-ish: thumb tip rising above MCP.
+    if tip and mcp and tip["y"] < mcp["y"] - 0.035:
+        return False
+    return True
+
+
+def looks_like_open_palm(landmarks: dict[str, Any]) -> bool:
+    """Open palm Hello — four fingers out and thumb extended (not the 4 / Undo pose)."""
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return False
+    if not (flags["index"] and flags["middle"] and flags["ring"] and flags["pinky"]):
+        return False
+    if not (flags["thumb"] or flags["thumb_up"]):
+        return False
+    return _mean_finger_extension(landmarks) >= 1.32
+
+
+def looks_like_four(landmarks: dict[str, Any]) -> bool:
+    """Four fingers up, thumb tucked — Undo last word (not Hello)."""
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return False
+    if not (flags["index"] and flags["middle"] and flags["ring"] and flags["pinky"]):
+        return False
+    if flags["thumb_up"] or flags["thumb_down"] or flags["thumb"]:
+        return False
+    return _mean_finger_extension(landmarks) >= 1.28
 
 
 def finger_extension_flags(landmarks: dict[str, Any]) -> dict[str, bool] | None:
@@ -444,20 +549,32 @@ def _heuristic_sign_score(landmarks: dict[str, Any], gesture: str) -> float:
 
     if gesture == "thumbs_up":
         if looks_like_thumbs_up(landmarks):
-            return 0.95
+            return 0.97
         if looks_like_fist(landmarks):
-            return 0.15
+            return 0.12
         curled = sum(1 for f in others if not f)
-        return min(0.45, (0.25 if thumb_up else 0.0) + 0.05 * curled)
+        return min(0.42, (0.22 if thumb_up else 0.0) + 0.05 * curled)
     if gesture == "thumbs_down":
         curled = sum(1 for f in others if not f)
         return min(1.0, (0.55 if thumb_down else 0.0) + 0.1125 * curled)
     if gesture == "open_palm":
+        if looks_like_open_palm(landmarks):
+            return 0.94
+        if looks_like_four(landmarks):
+            return 0.12
         extended = sum(1 for f in others if f)
-        return min(1.0, 0.25 * extended + (0.1 if flags["thumb"] else 0.0))
+        return min(1.0, 0.22 * extended + (0.08 if flags["thumb"] else 0.0))
+    if gesture == "four":
+        if looks_like_four(landmarks):
+            return 0.97
+        if looks_like_open_palm(landmarks):
+            return 0.12
+        extended = sum(1 for f in others if f)
+        thumb_tucked = not thumb_up and not thumb_down and not flags["thumb"]
+        return min(1.0, 0.2 * extended + (0.2 if thumb_tucked else 0.0))
     if gesture == "fist":
         if looks_like_fist(landmarks):
-            return 0.95
+            return 0.97
         curled = sum(1 for f in others if not f)
         thumb_ok = not thumb_up and not thumb_down
         return min(1.0, 0.2 * curled + (0.2 if thumb_ok else 0.0))
@@ -835,6 +952,12 @@ def classify_sign_attempt(
     thumb_up = flags["thumb_up"]
     thumb_down = flags["thumb_down"]
     frames = buffer or []
+    motion = hand_motion_energy(frames)
+    wag = buffer_looks_like_wave(frames)
+
+    # Motion Goodbye beats still Hello when a real wag is present.
+    if wag and index and middle:
+        return "wave"
 
     # More specific finger combinations first so they are not stolen by
     # thumbs-up / pointing / open-palm / wave.
@@ -847,22 +970,22 @@ def classify_sign_attempt(
     if looks_like_thumbs_up(landmarks):
         return "thumbs_up"
 
-    if thumb_down and not index and not middle and not ring and not pinky:
+    if thumb_down and _fingers_clearly_curled(landmarks):
         return "thumbs_down"
 
-    if index and middle and ring and not pinky:
+    if index and middle and ring and not pinky and not thumb_up:
         return "want"
 
-    if index and middle and not ring and not pinky:
+    if index and middle and not ring and not pinky and not thumb_up:
         return "peace_sign"
 
-    if index and not middle and not ring and not pinky:
+    if index and not middle and not ring and not pinky and not thumb_up:
         return "pointing"
 
-    if pinky and not index and not middle and not ring:
+    if pinky and not index and not middle and not ring and not thumb_up:
         return "you"
 
-    if (not index) and middle and ring and pinky:
+    if (not index) and middle and ring and pinky and not thumb_up:
         return "okay"
 
     if looks_like_fist(landmarks):
@@ -871,11 +994,24 @@ def classify_sign_attempt(
     if not index and not middle and not ring and not pinky:
         return "fist"
 
-    # Goodbye is a wag, not a held palm — require left-right-left motion.
-    if index and middle and buffer_looks_like_wave(frames):
-        return "wave"
+    # Four fingers + thumb tucked = Undo. Open palm (thumb out) = Hello.
+    if looks_like_four(landmarks):
+        if motion >= HAND_MOTION_ACTIVE_THRESHOLD and not wag:
+            return "none"
+        return "four"
+
+    # Still open palm = Hello. Moving palm without a confirmed wag stays none
+    # so Hello does not steal Goodbye mid-motion.
+    if looks_like_open_palm(landmarks):
+        if motion >= HAND_MOTION_ACTIVE_THRESHOLD and not wag:
+            return "none"
+        return "open_palm"
 
     if index and middle and ring and pinky:
+        if motion >= HAND_MOTION_ACTIVE_THRESHOLD and not wag:
+            return "none"
+        if not thumb_up and not flags["thumb"]:
+            return "four"
         return "open_palm"
 
     return "none"
@@ -1188,11 +1324,23 @@ def score_hand_pose(
         )
 
     if gesture == "thumbs_up" and looks_like_fist(landmarks):
-        score = min(score, 0.28)
+        score = min(score, 0.22)
+    if gesture == "fist" and looks_like_thumbs_up(landmarks):
+        score = min(score, 0.22)
     if gesture == "fist" and looks_like_fist(landmarks):
-        score = max(score, 0.88)
+        score = max(score, 0.90)
     if gesture == "thumbs_up" and looks_like_thumbs_up(landmarks):
+        score = max(score, 0.90)
+    if gesture == "open_palm" and looks_like_open_palm(landmarks):
         score = max(score, 0.88)
+    if gesture == "open_palm" and looks_like_four(landmarks):
+        score = min(score, 0.18)
+    if gesture == "open_palm" and looks_like_fist(landmarks):
+        score = min(score, 0.20)
+    if gesture == "four" and looks_like_four(landmarks):
+        score = max(score, 0.92)
+    if gesture == "four" and looks_like_open_palm(landmarks):
+        score = min(score, 0.18)
 
     matched = score >= threshold
     return {
@@ -1247,6 +1395,24 @@ def best_sign_pose(
 
     chosen = max(scores, key=scores.get) if scores else None
     chosen_score = float(scores.get(chosen, 0.0)) if chosen else 0.0
+
+    # Reject near-ties unless the finger classifier already named that sign.
+    if chosen is not None and scores:
+        ranked = sorted(scores.values(), reverse=True)
+        if (
+            len(ranked) >= 2
+            and ranked[0] - ranked[1] < 0.06
+            and classified_attempt not in (chosen, None)
+        ):
+            if (
+                classified_attempt in SIGN_POSE_GESTURES
+                and classified_attempt in scores
+                and float(scores[classified_attempt]) >= SIGN_ATTEMPT_FEEDBACK_THRESHOLD
+            ):
+                chosen = classified_attempt
+                chosen_score = float(scores[classified_attempt])
+            else:
+                return None, ranked[0], scores, {}
 
     if chosen is None:
         return None, 0.0, scores, {}

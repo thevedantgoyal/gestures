@@ -45,6 +45,7 @@ GESTURE_REGISTRY: dict[str, GestureSpec] = {
     "thumbs_down": {"name": "thumbs_down", "type": "pose", "domain": "sign_language"},
     "open_palm": {"name": "open_palm", "type": "pose", "domain": "sign_language"},
     "fist": {"name": "fist", "type": "pose", "domain": "sign_language"},
+    "four": {"name": "four", "type": "pose", "domain": "sign_language"},
     "pointing": {"name": "pointing", "type": "pose", "domain": "sign_language"},
     "peace_sign": {"name": "peace_sign", "type": "pose", "domain": "sign_language"},
     "please": {"name": "please", "type": "pose", "domain": "sign_language"},

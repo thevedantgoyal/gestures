@@ -87,37 +87,34 @@ export function SignTrainer({
 
   return (
     <aside
-      className="flex w-full shrink-0 flex-col border border-ink/15 bg-surface"
+      className="panel fade-up flex w-full shrink-0 flex-col overflow-hidden"
       aria-label="Train sign model"
     >
-      <div className="flex items-start justify-between gap-3 border-b border-ink/10 px-5 py-4">
+      <div className="flex items-start justify-between gap-3 border-b border-ink/8 px-5 py-4">
         <div>
-          <h2 className="font-heading text-lg font-medium text-ink">
+          <h2 className="font-heading text-xl font-medium text-ink">
             Train model
           </h2>
           <p className="mt-1 text-xs leading-relaxed text-muted">
-            Add confirmed holds, train a real sklearn classifier, then promote
-            it so Talk uses the model instead of the hardcoded rules. Wave still
-            uses motion rules.
+            Add samples → Train → Promote. Talk keeps using rules until you
+            promote. Wave stays on motion rules.
           </p>
         </div>
         <button
           type="button"
           onClick={onClose}
-          className="shrink-0 text-xs text-muted hover:text-ink"
+          className="nav-pill shrink-0 !px-3 !py-1.5"
         >
           Close
         </button>
       </div>
 
-      <div className="border-b border-ink/10 px-5 py-4">
-        <p className="text-xs font-medium uppercase tracking-wide text-muted">
-          Overall
-        </p>
-        <p className="mt-2 text-sm text-ink">
+      <div className="border-b border-ink/8 px-5 py-4">
+        <p className="soft-label">Overall</p>
+        <p className="mt-2 text-sm leading-relaxed text-ink">
           {overall ? (
             <>
-              {overall.gold_holds} gold holds · live path{" "}
+              {overall.gold_holds} samples ·{" "}
               {stats ? livePathLabel(sourceToLivePath(stats.source)) : "Rules"}
               {stats?.model.version ? ` · ${stats.model.version}` : ""}
             </>
@@ -125,15 +122,15 @@ export function SignTrainer({
             "Loading sample counts…"
           )}
         </p>
-        <div className="mt-3 h-1.5 w-full bg-ink/10">
+        <div className="progress-track mt-3">
           <div
-            className="h-full bg-accent"
+            className="progress-fill bg-accent"
             style={{ width: `${overallPercent}%` }}
           />
         </div>
         {last ? (
-          <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
-            <div className="border border-ink/10 px-3 py-2">
+          <div className="mt-3 grid grid-cols-2 gap-2.5">
+            <div className="panel-tight px-3 py-3">
               <p className="text-xs text-muted">
                 {last.accuracy_split === "train"
                   ? "Train accuracy"
@@ -143,7 +140,7 @@ export function SignTrainer({
                 {percentLabel(last.val_accuracy)}
               </p>
             </div>
-            <div className="border border-ink/10 px-3 py-2">
+            <div className="panel-tight px-3 py-3">
               <p className="text-xs text-muted">Fit accuracy</p>
               <p className="font-heading mt-1 text-xl text-ink">
                 {percentLabel(last.train_accuracy)}
@@ -151,9 +148,9 @@ export function SignTrainer({
             </div>
           </div>
         ) : (
-          <p className="mt-2 text-xs text-muted">
-            No trained model yet. Need {stats?.min_train_holds ?? 3}+ holds on
-            at least two signs, then Train now.
+          <p className="mt-2 text-xs leading-relaxed text-muted">
+            Need {stats?.min_train_holds ?? 3}+ samples on at least two signs,
+            then Train now.
           </p>
         )}
         {last?.warnings?.length ? (
@@ -161,22 +158,20 @@ export function SignTrainer({
         ) : null}
       </div>
 
-      <div className="border-b border-ink/10 px-5 py-4">
-        <p className="text-xs font-medium uppercase tracking-wide text-muted">
-          Live test
-        </p>
-        <p className="mt-2 text-sm text-ink">
+      <div className="border-b border-ink/8 px-5 py-4">
+        <p className="soft-label">Live test</p>
+        <p className="mt-2 text-sm leading-relaxed text-ink">
           {liveTest?.available
             ? `${liveLabel(liveTest.label)} · ${percentLabel(testProb)} confidence · ${
                 liveTest.agree === true
                   ? "agrees with rules"
                   : liveTest.agree === false
-                    ? "disagrees with rules"
+                    ? "differs from rules"
                     : "no rules compare"
               }`
             : liveIsModel
               ? "Model is live. Hold a sign to see confidence."
-              : "Train and promote to test the model live. Rules still answer until then."}
+              : "Train and promote to test live. Rules answer until then."}
         </p>
         {liveTest?.recognizer ? (
           <p className="mt-1 text-xs text-muted">
@@ -186,7 +181,7 @@ export function SignTrainer({
         ) : null}
       </div>
 
-      <ul className="max-h-64 space-y-2 overflow-y-auto px-5 py-4">
+      <ul className="max-h-56 space-y-2 overflow-y-auto px-4 py-4">
         {(
           stats?.gestures ??
           SIGN_VOCAB.map((item) => ({
@@ -207,17 +202,17 @@ export function SignTrainer({
               <button
                 type="button"
                 onClick={() => onSelect(row.gesture)}
-                className={`w-full border px-3 py-2 text-left transition-colors ${
+                className={`w-full rounded-[0.85rem] border px-3 py-2.5 text-left transition-all ${
                   isSelected
-                    ? "border-accent bg-accent/10"
-                    : "border-ink/10 bg-background hover:border-ink/30"
+                    ? "border-accent/40 bg-accent-soft"
+                    : "border-ink/10 bg-background/60 hover:border-accent/25 hover:bg-white"
                 }`}
               >
                 <span className="flex items-baseline justify-between gap-2">
-                  <span className="text-sm font-medium text-ink">
+                  <span className="text-sm font-semibold text-ink">
                     {row.meaning}
                   </span>
-                  <span className={`text-xs ${statusTone(row.status)}`}>
+                  <span className={`text-xs font-medium ${statusTone(row.status)}`}>
                     {trainStatusLabel(row.status)}
                   </span>
                 </span>
@@ -232,9 +227,9 @@ export function SignTrainer({
                       : `${rowPercent}%`}
                   </span>
                 </span>
-                <span className="mt-2 block h-1 w-full bg-ink/10">
+                <span className="progress-track mt-2 block">
                   <span
-                    className="block h-full bg-accent"
+                    className="progress-fill block bg-accent"
                     style={{ width: `${rowPercent}%` }}
                   />
                 </span>
@@ -244,15 +239,15 @@ export function SignTrainer({
         })}
       </ul>
 
-      <div className="border-t border-ink/10 px-5 py-4">
+      <div className="border-t border-ink/8 px-5 py-4">
         <p className="font-heading text-xl font-medium text-ink">
           {selectedVocab?.meaning ?? selected?.meaning ?? "Hello"}
         </p>
-        <p className="mt-1 text-xs text-muted">
+        <p className="mt-1 text-xs leading-relaxed text-muted">
           {selected
             ? `${selected.gold_holds} confirmed ${
                 selected.type === "motion" ? "clips" : "holds"
-              }. Train uses ${stats?.min_train_holds ?? 3}+ holds per sign.`
+              }. Train needs ${stats?.min_train_holds ?? 3}+ per sign.`
             : "Select a sign, then add a confirmed sample."}
         </p>
         {selected?.metrics ? (
@@ -266,7 +261,7 @@ export function SignTrainer({
           type="button"
           onClick={() => onAddSamples(selectedGesture)}
           disabled={busy}
-          className="mt-3 min-h-11 w-full bg-accent px-4 py-2.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
+          className="btn-primary mt-3 w-full"
         >
           {selected?.type === "motion" ? "Add wave clips" : "Add samples"}
         </button>
@@ -274,7 +269,7 @@ export function SignTrainer({
           type="button"
           onClick={onTrain}
           disabled={busy || !stats?.can_train}
-          className="mt-2 min-h-11 w-full border border-ink/20 px-4 py-2.5 text-sm font-medium text-ink disabled:cursor-not-allowed disabled:opacity-40"
+          className="btn-secondary mt-2 w-full"
         >
           {trainBusy ? "Training…" : "Train now"}
         </button>
@@ -282,7 +277,7 @@ export function SignTrainer({
           type="button"
           onClick={onPromote}
           disabled={busy || !stats?.can_promote}
-          className="mt-2 min-h-11 w-full border border-ink/20 px-4 py-2.5 text-sm font-medium text-ink disabled:cursor-not-allowed disabled:opacity-40"
+          className="btn-secondary mt-2 w-full"
         >
           Promote model
         </button>
@@ -290,14 +285,13 @@ export function SignTrainer({
           type="button"
           onClick={onUseRules}
           disabled={busy || !liveIsModel}
-          className="mt-2 min-h-11 w-full border border-ink/20 px-4 py-2.5 text-sm font-medium text-ink disabled:cursor-not-allowed disabled:opacity-40"
+          className="btn-secondary mt-2 w-full"
         >
           Use rules again
         </button>
-        <p className="mt-2 text-xs leading-relaxed text-muted">
-          Train fits a softmax classifier on your holds (learning rate 0.25,
-          400 epochs, L2 0.001). Promote makes that model the live recognizer.
-          If confidence is below 55%, rules fill in. Goodbye still needs a wave.
+        <p className="mt-3 text-xs leading-relaxed text-muted">
+          Promote makes the model live for still signs. Below 55% confidence,
+          rules fill in. Goodbye still needs a wave.
         </p>
         {stats?.train_blockers?.length ? (
           <p className="mt-2 text-xs text-alert">{stats.train_blockers[0]}</p>
