@@ -9,8 +9,55 @@ export const SIGN_MEANING_VALUES: readonly SignMeaning[] = SIGN_VOCAB.map(
 export const MAX_SENTENCE_TOKENS = 10;
 export const SENTENCE_SPEAK_IDLE_MS = 2200;
 
+/** Natural English / AAC reading order (not signing order). */
+const WORD_ORDER: Record<SignMeaning, number> = {
+  Hello: 10,
+  Please: 20,
+  Yes: 30,
+  No: 30,
+  Okay: 35,
+  You: 40,
+  Want: 50,
+  Help: 60,
+  "I love you": 70,
+  "Thank you": 80,
+  Goodbye: 90,
+  Clear: 999,
+  Undo: 999,
+};
+
 export function isSignMeaning(value: string): value is SignMeaning {
   return (SIGN_MEANING_VALUES as readonly string[]).includes(value);
+}
+
+/**
+ * Live preview: only the signed words, in the order they were signed.
+ * Does not expand Want → "I want that".
+ */
+export function formatSignedWords(meanings: readonly string[]): string {
+  const tokens = meanings.filter(isSignMeaning);
+  if (tokens.length === 0) return "";
+  return tokens.join(", ");
+}
+
+/**
+ * Sort signed words into a natural spoken order.
+ * Example: Goodbye, Hello, Thank you → Hello, Thank you, Goodbye.
+ * Stable for equal ranks (keeps relative signing order).
+ */
+export function reorderSignTokens(
+  meanings: readonly string[],
+): SignMeaning[] {
+  const tokens = meanings.filter(isSignMeaning);
+  return [...tokens]
+    .map((token, index) => ({ token, index }))
+    .sort((a, b) => {
+      const rankA = WORD_ORDER[a.token] ?? 50;
+      const rankB = WORD_ORDER[b.token] ?? 50;
+      if (rankA !== rankB) return rankA - rankB;
+      return a.index - b.index;
+    })
+    .map((row) => row.token);
 }
 
 function clauseFor(meaning: SignMeaning): string {
@@ -77,14 +124,15 @@ const TRIPLE_CLAUSES: Partial<Record<string, string>> = {
   "Yes|Please|Help": "Yes, please help me",
   "Please|You|Help": "Please, I need your help",
   "Hello|I love you|You": "Hello. I love you",
+  "Hello|Thank you|Goodbye": "Hello. Thank you. Goodbye",
 };
 
 /**
- * Turns a sequence of recognized sign meanings into one spoken sentence.
- * Common everyday combinations are merged so it sounds like a person talking.
+ * Turns signed words into one spoken sentence with grammar templates.
+ * Words are reordered into natural English order first.
  */
 export function composeSignSentence(meanings: readonly string[]): string {
-  const tokens = meanings.filter(isSignMeaning);
+  const tokens = reorderSignTokens(meanings);
   if (tokens.length === 0) return "";
 
   const clauses: string[] = [];

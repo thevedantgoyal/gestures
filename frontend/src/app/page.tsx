@@ -8,12 +8,14 @@ import {
 } from "@mediapipe/tasks-vision";
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
-import { SignCommunicator } from "../components/SignCommunicator";
+import { SignCommunicator, type ConversationTurn } from "../components/SignCommunicator";
 import { SignRulebook } from "../components/SignRulebook";
 import { SignTrainer } from "../components/SignTrainer";
 import {
   appendSignToken,
   composeSignSentence,
+  formatSignedWords,
+  reorderSignTokens,
   undoLastSignToken,
   SENTENCE_SPEAK_IDLE_MS,
 } from "../lib/signSentence";
@@ -77,6 +79,8 @@ const WS_MAX_RECONNECT_ATTEMPTS = 5;
 const WS_RECONNECT_DELAY_MS = 1500;
 const COACHING_UI_TIMEOUT_MS = 5000;
 const COACHING_FALLBACK_TEXT = "Adjust your arm position and try again.";
+const MAX_CONVERSATION_TURNS = 8;
+const REPLY_FALLBACK_TEXT = "I heard you. Please sign that again.";
 
 const RECORD_DURATION_MS: Record<CalibrationGesture, number> = {
   exit_pointing: 3000,
@@ -591,7 +595,18 @@ export default function Home() {
   const [coachingText, setCoachingText] = useState<string | null>(null);
   const [coachingLoading, setCoachingLoading] = useState(false);
   const [speaking, setSpeaking] = useState(false);
+  const [speakingTarget, setSpeakingTarget] = useState<
+    "user" | "assistant" | null
+  >(null);
   const [polishing, setPolishing] = useState(false);
+  const [replyLoading, setReplyLoading] = useState(false);
+  const [replyError, setReplyError] = useState<string | null>(null);
+  const [replySource, setReplySource] = useState<"ollama" | "fallback" | null>(
+    null,
+  );
+  const [userSentence, setUserSentence] = useState<string | null>(null);
+  const [assistantReply, setAssistantReply] = useState<string | null>(null);
+  const [conversation, setConversation] = useState<ConversationTurn[]>([]);
   const [voiceUnlocked, setVoiceUnlocked] = useState(false);
   const [motionProgress, setMotionProgress] = useState<number | null>(null);
   const [motionHint, setMotionHint] = useState<string | null>(null);
@@ -643,6 +658,16 @@ export default function Home() {
   const sentenceTokensRef = useRef<string[]>([]);
   const lastCommittedSignRef = useRef<string | null>(null);
   const releasedAfterCommitRef = useRef(true);
+  const conversationRef = useRef<ConversationTurn[]>([]);
+  const replyInFlightRef = useRef(false);
+  const finalizeInFlightRef = useRef(false);
+  const lastRepliedKeyRef = useRef<string | null>(null);
+  const speakingTargetRef = useRef<"user" | "assistant" | null>(null);
+  const pendingAssistantSpeechRef = useRef<string | null>(null);
+  const finalizeGenerationRef = useRef(0);
+  const speakWithGrammarPolishRef = useRef<
+    (tokens: string[]) => Promise<void>
+  >(async () => {});
   const [sentenceTokens, setSentenceTokens] = useState<string[]>([]);
   const [lastSpokenSentence, setLastSpokenSentence] = useState<string | null>(
     null,
@@ -675,7 +700,23 @@ export default function Home() {
   } | null>(null);
 
   const modelReady = mode === "aviation" ? poseReady : handReady;
-  const composedSentence = composeSignSentence(sentenceTokens);
+  // While signing: show only the words (Want), not expanded grammar (I want that).
+  const signedWordsPreview = formatSignedWords(sentenceTokens);
+
+  function clearConversationState() {
+    conversationRef.current = [];
+    setConversation([]);
+    setUserSentence(null);
+    setAssistantReply(null);
+    setReplyError(null);
+    setReplySource(null);
+    setReplyLoading(false);
+    replyInFlightRef.current = false;
+    finalizeInFlightRef.current = false;
+    lastRepliedKeyRef.current = null;
+    pendingAssistantSpeechRef.current = null;
+    finalizeGenerationRef.current += 1;
+  }
 
   function resetSentenceBuilder() {
     sentenceTokensRef.current = [];
@@ -684,12 +725,30 @@ export default function Home() {
     setSentenceTokens([]);
     setLastSpokenSentence(null);
     setSpeaking(false);
+    setSpeakingTarget(null);
+    speakingTargetRef.current = null;
     setPolishing(false);
+    clearConversationState();
     stopAllSpeech();
   }
 
+  function startNewConversation() {
+    if (speaking || polishing || replyLoading || finalizeInFlightRef.current) {
+      return;
+    }
+    // Same full reset as Clear / fist: tokens + conversation + speech.
+    resetSentenceBuilder();
+  }
+
   function undoLastWord() {
-    if (speaking || polishing) return;
+    if (
+      speaking ||
+      polishing ||
+      replyLoading ||
+      finalizeInFlightRef.current
+    ) {
+      return;
+    }
     const next = undoLastSignToken(sentenceTokensRef.current);
     sentenceTokensRef.current = next;
     lastCommittedSignRef.current = null;
@@ -697,13 +756,44 @@ export default function Home() {
     setSentenceTokens(next);
   }
 
-  function speakComposedSentence(text: string) {
+  function speakAssistantReply(text: string) {
+    const spoken = text.trim();
+    if (!spoken) return;
+    if (!voiceUnlockedRef.current) return;
+    if (speakingTargetRef.current === "user") {
+      pendingAssistantSpeechRef.current = spoken;
+      return;
+    }
+    speakingTargetRef.current = "assistant";
+    setSpeakingTarget("assistant");
+    speakSentence(spoken, {
+      onStart: () => setSpeaking(true),
+      onEnd: () => {
+        setSpeaking(false);
+        speakingTargetRef.current = null;
+        setSpeakingTarget(null);
+      },
+    });
+  }
+
+  function speakUserSentence(text: string) {
     const spoken = text.trim();
     if (!spoken) return;
     setLastSpokenSentence(spoken);
+    speakingTargetRef.current = "user";
+    setSpeakingTarget("user");
     speakSentence(spoken, {
       onStart: () => setSpeaking(true),
-      onEnd: () => setSpeaking(false),
+      onEnd: () => {
+        setSpeaking(false);
+        speakingTargetRef.current = null;
+        setSpeakingTarget(null);
+        const pending = pendingAssistantSpeechRef.current;
+        if (pending) {
+          pendingAssistantSpeechRef.current = null;
+          speakAssistantReply(pending);
+        }
+      },
     });
     sentenceTokensRef.current = [];
     lastCommittedSignRef.current = null;
@@ -711,45 +801,152 @@ export default function Home() {
     setSentenceTokens([]);
   }
 
+  async function requestAssistantReply(
+    sentence: string,
+    tokens: string[],
+    generation: number,
+  ) {
+    const spoken = sentence.trim();
+    if (!spoken) return;
+    const replyKey = `${spoken}|${tokens.join("|")}`;
+    if (replyInFlightRef.current) return;
+    if (lastRepliedKeyRef.current === replyKey) return;
+    if (generation !== finalizeGenerationRef.current) return;
+
+    replyInFlightRef.current = true;
+    lastRepliedKeyRef.current = replyKey;
+    setReplyLoading(true);
+    setReplyError(null);
+    setUserSentence(spoken);
+
+    const history = conversationRef.current.slice(-MAX_CONVERSATION_TURNS);
+    let reply = REPLY_FALLBACK_TEXT;
+    let source: "ollama" | "fallback" = "fallback";
+
+    try {
+      const response = await fetch(`${API_BASE}/ml/reply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sentence: spoken,
+          tokens,
+          history,
+          session_id: sessionIdRef.current || undefined,
+          locale: "en-IN",
+        }),
+      });
+      if (generation !== finalizeGenerationRef.current) return;
+      if (!response.ok) {
+        setReplyError(
+          `Assistant unavailable (HTTP ${response.status}). Showing a short offline reply.`,
+        );
+      } else {
+        const data = (await response.json()) as {
+          reply?: string;
+          source?: string;
+          detail?: string | null;
+        };
+        if (typeof data.reply === "string" && data.reply.trim()) {
+          reply = data.reply.trim();
+        }
+        if (data.source === "ollama" || data.source === "fallback") {
+          source = data.source;
+        }
+        // Soft Ollama fallback is a status (badge), not an error. Hard failures set replyError above/below.
+        setReplyError(null);
+      }
+    } catch (err) {
+      console.warn("[reply] failed, using fallback", err);
+      if (generation !== finalizeGenerationRef.current) return;
+      setReplyError(
+        "Could not reach the assistant. Showing a short offline reply.",
+      );
+    } finally {
+      if (generation === finalizeGenerationRef.current) {
+        setReplyLoading(false);
+        replyInFlightRef.current = false;
+      }
+    }
+
+    if (generation !== finalizeGenerationRef.current) return;
+
+    setAssistantReply(reply);
+    setReplySource(source);
+    const nextTurns: ConversationTurn[] = [
+      ...history,
+      { role: "user" as const, content: spoken },
+      { role: "assistant" as const, content: reply },
+    ].slice(-MAX_CONVERSATION_TURNS);
+    conversationRef.current = nextTurns;
+    setConversation(nextTurns);
+    speakAssistantReply(reply);
+  }
+
   async function speakWithGrammarPolish(tokens: string[]) {
-    const fallback = composeSignSentence(tokens);
+    // Natural English order before grammar templates / Ollama polish.
+    const ordered = reorderSignTokens(tokens);
+    const fallback = composeSignSentence(ordered);
     if (!fallback.trim()) return;
-    if (polishing || speaking) return;
+    if (
+      finalizeInFlightRef.current ||
+      replyInFlightRef.current ||
+      polishing ||
+      speaking ||
+      replyLoading
+    ) {
+      return;
+    }
+    // Synchronous lock so double-click / Strict Mode cannot start two finalizes.
+    finalizeInFlightRef.current = true;
+    const generation = ++finalizeGenerationRef.current;
+    // Allow a new utterance of the same words after a completed cycle.
+    lastRepliedKeyRef.current = null;
     setPolishing(true);
     let spoken = fallback;
     try {
-      const response = await fetch(`${API_BASE}/ml/polish-sentence`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tokens, fallback }),
-      });
-      if (response.ok) {
-        const data = (await response.json()) as {
-          sentence?: string;
-          source?: string;
-        };
-        if (typeof data.sentence === "string" && data.sentence.trim()) {
-          spoken = data.sentence.trim();
+      try {
+        const response = await fetch(`${API_BASE}/ml/polish-sentence`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tokens: ordered, fallback }),
+        });
+        if (response.ok) {
+          const data = (await response.json()) as {
+            sentence?: string;
+            source?: string;
+          };
+          if (typeof data.sentence === "string" && data.sentence.trim()) {
+            spoken = data.sentence.trim();
+          }
+          console.log("[polish]", data.source ?? "unknown", spoken);
         }
-        console.log("[polish]", data.source ?? "unknown", spoken);
+      } catch (err) {
+        console.warn("[polish] failed, using template", err);
+      } finally {
+        setPolishing(false);
       }
-    } catch (err) {
-      console.warn("[polish] failed, using template", err);
+      if (generation !== finalizeGenerationRef.current) return;
+      setUserSentence(spoken);
+      speakUserSentence(spoken);
+      await requestAssistantReply(spoken, ordered, generation);
     } finally {
-      setPolishing(false);
+      if (generation === finalizeGenerationRef.current) {
+        finalizeInFlightRef.current = false;
+      }
     }
-    speakComposedSentence(spoken);
   }
+
+  speakWithGrammarPolishRef.current = speakWithGrammarPolish;
 
   useEffect(() => {
     if (mode !== "sign_language" || !isStreaming || !voiceUnlocked) return;
     if (sentenceTokens.length === 0) return;
-    if (speaking || polishing) return;
+    if (speaking || polishing || replyLoading) return;
     // Keep collecting signs while the current one is still locked.
     if (gestureFeedback?.correct) return;
     const tokens = [...sentenceTokensRef.current];
     const timer = window.setTimeout(() => {
-      void speakWithGrammarPolish(tokens);
+      void speakWithGrammarPolishRef.current(tokens);
     }, SENTENCE_SPEAK_IDLE_MS);
     return () => window.clearTimeout(timer);
   }, [
@@ -759,6 +956,7 @@ export default function Home() {
     voiceUnlocked,
     speaking,
     polishing,
+    replyLoading,
     gestureFeedback?.correct,
   ]);
 
@@ -2010,7 +2208,7 @@ export default function Home() {
         gestureFeedback.gesture in GESTURE_LABELS
         ? GESTURE_LABELS[gestureFeedback.gesture as CalibrationGesture]
         : "Exit Pointing"
-      : composedSentence || lastSpokenSentence || "Talk with signs";
+      : signedWordsPreview || lastSpokenSentence || "Talk with signs";
   const scorePercent =
     gestureFeedback && gestureFeedback.gesture !== "none"
       ? Math.round(Math.max(0, Math.min(1, gestureFeedback.score)) * 100)
@@ -2324,10 +2522,17 @@ export default function Home() {
               <SignCommunicator
                 voiceUnlocked={voiceUnlocked}
                 speaking={speaking}
+                speakingTarget={speakingTarget}
                 polishing={polishing}
+                replyLoading={replyLoading}
+                replyError={replyError}
+                replySource={replySource}
                 tokens={sentenceTokens}
-                sentence={composedSentence}
+                sentence={signedWordsPreview}
                 lastSpoken={lastSpokenSentence}
+                userSentence={userSentence}
+                assistantReply={assistantReply}
+                conversation={conversation}
                 currentMeaning={
                   gestureFeedback?.correct ? (gestureFeedback.meaning ?? null) : null
                 }
@@ -2354,17 +2559,48 @@ export default function Home() {
                   });
                 }}
                 onSpeak={() => {
+                  if (finalizeInFlightRef.current) return;
                   void speakWithGrammarPolish([...sentenceTokensRef.current]);
                 }}
                 onUndo={undoLastWord}
                 onRepeat={() => {
-                  if (!lastSpokenSentence) return;
-                  speakSentence(lastSpokenSentence, {
+                  const text = userSentence || lastSpokenSentence;
+                  if (
+                    !text ||
+                    speaking ||
+                    polishing ||
+                    replyLoading ||
+                    finalizeInFlightRef.current
+                  ) {
+                    return;
+                  }
+                  pendingAssistantSpeechRef.current = null;
+                  speakingTargetRef.current = "user";
+                  setSpeakingTarget("user");
+                  speakSentence(text, {
                     onStart: () => setSpeaking(true),
-                    onEnd: () => setSpeaking(false),
+                    onEnd: () => {
+                      setSpeaking(false);
+                      speakingTargetRef.current = null;
+                      setSpeakingTarget(null);
+                    },
                   });
                 }}
+                onRepeatReply={() => {
+                  if (
+                    !assistantReply ||
+                    speaking ||
+                    polishing ||
+                    replyLoading ||
+                    finalizeInFlightRef.current
+                  ) {
+                    return;
+                  }
+                  pendingAssistantSpeechRef.current = null;
+                  speakAssistantReply(assistantReply);
+                }}
                 onClear={resetSentenceBuilder}
+                onNewConversation={startNewConversation}
               />
             ) : (
             <div className="panel fade-up p-5 sm:p-6">

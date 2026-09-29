@@ -87,6 +87,7 @@ from app.ml.train import TrainError, train_sign_classifier
 from app.scoring.sign_meanings import SIGN_MEANINGS
 from app.scoring.sign_stability import SignStabilizer
 from app.services.coaching import get_coaching_text
+from app.services.conversation_reply import generate_conversation_reply
 from app.services.sentence_polish import polish_sentence_with_ollama
 from app.sessions import (
     get_session_attempts,
@@ -160,6 +161,19 @@ class RuntimeUpdateRequest(BaseModel):
 class PolishSentenceRequest(BaseModel):
     tokens: list[str] = Field(default_factory=list)
     fallback: str = ""
+
+
+class ConversationTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1)
+
+
+class ConversationReplyRequest(BaseModel):
+    sentence: str = Field(..., min_length=1)
+    tokens: list[str] = Field(default_factory=list)
+    history: list[ConversationTurn] = Field(default_factory=list)
+    session_id: str | None = None
+    locale: str | None = "en-IN"
 
 
 @app.get("/health")
@@ -544,6 +558,33 @@ def ml_polish_sentence(request: PolishSentenceRequest):
         "source": result.get("source") or "fallback",
         "detail": result.get("detail"),
         "tokens": tokens,
+    }
+
+
+@app.post("/ml/reply")
+def ml_conversation_reply(request: ConversationReplyRequest):
+    """Answer the user's AAC sentence. Does not rewrite or polish it."""
+    sentence = (request.sentence or "").strip()
+    if not sentence:
+        raise HTTPException(status_code=422, detail="sentence is required")
+    tokens = [str(item).strip() for item in request.tokens if str(item).strip()]
+    history = [
+        {"role": turn.role, "content": turn.content.strip()}
+        for turn in request.history
+        if turn.content.strip()
+    ]
+    result = generate_conversation_reply(
+        sentence,
+        tokens=tokens,
+        history=history,
+        session_id=request.session_id,
+        locale=request.locale,
+    )
+    return {
+        "status": "ok",
+        "reply": result.get("reply") or "I heard you. Please sign that again.",
+        "source": result.get("source") or "fallback",
+        "detail": result.get("detail"),
     }
 
 
@@ -935,6 +976,12 @@ def _evaluate_sign_language(
         display_gesture = "thumbs_up"
         best_score = max(
             float(pose_scores.get("thumbs_up") or 0.0),
+            SIGN_RECOGNITION_THRESHOLD + 0.08,
+        )
+    elif attempt == "you":
+        display_gesture = "you"
+        best_score = max(
+            float(pose_scores.get("you") or 0.0),
             SIGN_RECOGNITION_THRESHOLD + 0.08,
         )
     elif (

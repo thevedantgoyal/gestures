@@ -16,6 +16,7 @@ from app.config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT_SECONDS
 
 # Ordered token keys that already have a good composeSignSentence clause.
 # Keep in sync with frontend/src/lib/signSentence.ts PAIR_CLAUSES / TRIPLE_CLAUSES.
+# Keys use natural English order (after reorderSignTokens), not signing order.
 _KNOWN_GOOD_KEYS: frozenset[str] = frozenset(
     {
         "Hello|Help",
@@ -43,6 +44,7 @@ _KNOWN_GOOD_KEYS: frozenset[str] = frozenset(
         "Yes|Please|Help",
         "Please|You|Help",
         "Hello|I love you|You",
+        "Hello|Thank you|Goodbye",
     }
 )
 
@@ -64,6 +66,8 @@ _TOKEN_STEMS: dict[str, tuple[str, ...]] = {
 _SYSTEM = (
     "You turn AAC signed words into ONE natural spoken English sentence. "
     "Keep the same meaning. Include every signed idea. "
+    "You may reorder the signed words into natural English order "
+    "(for example Hello before Thank you before Goodbye). "
     "Do not invent people, places, or new actions. "
     "Do not reply with a bare list of words. "
     "No quotes, no markdown, no explanation.\n"
@@ -71,7 +75,8 @@ _SYSTEM = (
     "Signed: Please, Want, Help → Please, I want help.\n"
     "Signed: Hello, You → Hello, how are you.\n"
     "Signed: Yes, Please, Help → Yes, please help me.\n"
-    "Signed: Want, Help → I want help."
+    "Signed: Want, Help → I want help.\n"
+    "Signed: Goodbye, Hello, Thank you → Hello. Thank you. Goodbye."
 )
 
 
@@ -198,13 +203,14 @@ def polish_sentence_with_ollama(
         }
 
     user_prompt = (
-        "Signed words in order: "
+        "Signed words (already sorted toward natural English order): "
         + ", ".join(words)
         + ".\n"
         "Draft sentence (use this if unsure): "
         + template
         + "\n"
         "Reply with ONE natural spoken sentence only. "
+        "Keep natural English order. "
         "Prefer the draft when it already uses the signed words."
     )
     payload = {

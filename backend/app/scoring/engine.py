@@ -418,6 +418,10 @@ def looks_like_thumbs_up(landmarks: dict[str, Any]) -> bool:
     """Thumb sticks clearly above a closed fist — not a tucked thumb on a fist."""
     if not is_hand_landmarks(landmarks):
         return False
+    flags = finger_extension_flags(landmarks)
+    # Pinky-up (You) must never count as Yes.
+    if flags and flags["pinky"]:
+        return False
     tip = _point(landmarks, "thumb_tip")
     mcp = _point(landmarks, "thumb_mcp")
     if not tip or not mcp:
@@ -434,6 +438,81 @@ def looks_like_thumbs_up(landmarks: dict[str, Any]) -> bool:
     if not _thumb_tip_above_fingers(landmarks, margin=0.03):
         return False
     return thumb_r >= others + 0.18
+
+
+def _thumb_stuck_out_for_shaka(landmarks: dict[str, Any]) -> bool:
+    """True shaka thumb: tip far from the index knuckle, not resting on the fist.
+
+    MediaPipe often marks a tucked thumb as weakly `thumb_up`. Please must
+    require a clearly abducted thumb so pinky-only You is not stolen.
+    """
+    tip = _point(landmarks, "thumb_tip")
+    mcp = _point(landmarks, "thumb_mcp")
+    index_mcp = _point(landmarks, "index_mcp")
+    wrist = _point(landmarks, "wrist")
+    if not tip or not mcp or not index_mcp or not wrist:
+        return False
+    hand_scale = _dist2(wrist, index_mcp) + 1e-6
+    # Resting thumb sits near the index knuckle; shaka sticks out away from it.
+    if _dist2(tip, index_mcp) / hand_scale < 0.9:
+        return False
+    thumb_r = _finger_extension_ratio(landmarks, "thumb_tip", "thumb_mcp")
+    if thumb_r < 1.3:
+        return False
+    # Tip clearly displaced from MCP (up or sideways).
+    if abs(float(tip["y"]) - float(mcp["y"])) < 0.035 and abs(
+        float(tip["x"]) - float(mcp["x"])
+    ) < 0.05:
+        return False
+    return True
+
+
+def looks_like_please(landmarks: dict[str, Any]) -> bool:
+    """Shaka: thumb and pinky clearly out; index/middle/ring curled."""
+    if not is_hand_landmarks(landmarks):
+        return False
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return False
+    if not flags["pinky"]:
+        return False
+    if flags["index"] or flags["middle"] or flags["ring"]:
+        return False
+    if not _thumb_stuck_out_for_shaka(landmarks):
+        return False
+    pinky_r = _finger_extension_ratio(landmarks, "pinky_tip", "pinky_mcp")
+    return pinky_r >= 1.22
+
+
+def looks_like_you(landmarks: dict[str, Any]) -> bool:
+    """Only the pinky is clearly up — You (not Yes / Please / ILY)."""
+    if not is_hand_landmarks(landmarks):
+        return False
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return False
+    if not flags["pinky"]:
+        return False
+    if flags["index"] or flags["middle"] or flags["ring"]:
+        return False
+    # Real shaka (Please) — not a resting thumb that still flags thumb_up.
+    if looks_like_please(landmarks):
+        return False
+    pinky_r = _finger_extension_ratio(landmarks, "pinky_tip", "pinky_mcp")
+    if pinky_r < 1.22:
+        return False
+    # Pinky tip should sit clearly above the curled finger tips.
+    pinky_tip = _point(landmarks, "pinky_tip")
+    if not pinky_tip:
+        return False
+    curled_y: list[float] = []
+    for key in ("index_tip", "middle_tip", "ring_tip"):
+        other = _point(landmarks, key)
+        if other:
+            curled_y.append(float(other["y"]))
+    if curled_y and float(pinky_tip["y"]) > min(curled_y) - 0.01:
+        return False
+    return True
 
 
 def looks_like_fist(landmarks: dict[str, Any]) -> bool:
@@ -548,6 +627,8 @@ def _heuristic_sign_score(landmarks: dict[str, Any], gesture: str) -> float:
     others = (index, middle, ring, pinky)
 
     if gesture == "thumbs_up":
+        if looks_like_you(landmarks):
+            return 0.08
         if looks_like_thumbs_up(landmarks):
             return 0.97
         if looks_like_fist(landmarks):
@@ -593,9 +674,15 @@ def _heuristic_sign_score(landmarks: dict[str, Any], gesture: str) -> float:
         score += 0.2 * sum(1 for f in (ring, pinky) if not f)
         return min(1.0, score)
     if gesture == "please":
+        if looks_like_you(landmarks):
+            return 0.08
+        if looks_like_please(landmarks):
+            return 0.97
         score = 0.0
-        if thumb_up:
+        if _thumb_stuck_out_for_shaka(landmarks):
             score += 0.4
+        elif thumb_up:
+            score += 0.12
         if pinky:
             score += 0.35
         score += 0.083 * sum(1 for f in (index, middle, ring) if not f)
@@ -622,10 +709,14 @@ def _heuristic_sign_score(landmarks: dict[str, Any], gesture: str) -> float:
             score += 0.25
         return min(1.0, score)
     if gesture == "you":
+        if looks_like_you(landmarks):
+            return 0.97
+        if looks_like_please(landmarks):
+            return 0.1
         score = 0.0
         if pinky:
-            score += 0.45
-        score += 0.183 * sum(1 for f in (index, middle, ring) if not f)
+            score += 0.55
+        score += 0.15 * sum(1 for f in (index, middle, ring) if not f)
         return min(1.0, score)
     if gesture == "okay":
         score = 0.0
@@ -964,7 +1055,12 @@ def classify_sign_attempt(
     if thumb_up and index and pinky and not middle and not ring:
         return "i_love_you"
 
-    if thumb_up and pinky and not index and not middle and not ring:
+    # Pinky-only You before Please — a resting thumb often still flags thumb_up
+    # and used to steal You as shaka/Please.
+    if looks_like_you(landmarks):
+        return "you"
+
+    if looks_like_please(landmarks):
         return "please"
 
     if looks_like_thumbs_up(landmarks):
@@ -982,7 +1078,9 @@ def classify_sign_attempt(
     if index and not middle and not ring and not pinky and not thumb_up:
         return "pointing"
 
-    if pinky and not index and not middle and not ring and not thumb_up:
+    if pinky and not index and not middle and not ring and not looks_like_please(
+        landmarks
+    ):
         return "you"
 
     if (not index) and middle and ring and pinky and not thumb_up:
@@ -1325,6 +1423,18 @@ def score_hand_pose(
 
     if gesture == "thumbs_up" and looks_like_fist(landmarks):
         score = min(score, 0.22)
+    if gesture == "thumbs_up" and looks_like_you(landmarks):
+        score = min(score, 0.12)
+    if gesture == "please" and looks_like_you(landmarks):
+        score = min(score, 0.12)
+    if gesture == "please" and looks_like_please(landmarks):
+        score = max(score, 0.92)
+    if gesture == "you" and looks_like_you(landmarks):
+        score = max(score, 0.92)
+    if gesture == "you" and looks_like_please(landmarks):
+        score = min(score, 0.18)
+    if gesture == "you" and looks_like_thumbs_up(landmarks):
+        score = min(score, 0.20)
     if gesture == "fist" and looks_like_thumbs_up(landmarks):
         score = min(score, 0.22)
     if gesture == "fist" and looks_like_fist(landmarks):
